@@ -80,7 +80,7 @@ class GMModularHandler(BaseBrandHandler):
                 state=actual_state,
                 pincode=pincode.group(0) if pincode else "",
                 dealer_type="GM Experience Center",
-                website=location_link.get("href", "") if location_link else self.LOCATOR_URL,
+                map_url=location_link.get("href", "") if location_link else None,
             )
             if record.is_valid():
                 records.append(record)

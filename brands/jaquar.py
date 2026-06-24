@@ -141,7 +141,7 @@ class JaquarHandler(BaseBrandHandler):
                 state=self._normalize(item.get("StateProvince", "") or query_state),
                 pincode="",  # Parsed downstream inside excel exporter workflows if needed
                 dealer_type=self._normalize(item.get("DealerType", "Authorized Dealer")),
-                website=self._normalize(item.get("Location", ""))  # Holds explicit Google Maps destination URL strings
+                map_url=self._normalize(item.get("Location", "")),
             )
 
             if record.is_valid():

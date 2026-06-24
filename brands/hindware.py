@@ -192,6 +192,6 @@ class HindwareHandler(BaseBrandHandler):
             city=city,
             state=state,
             dealer_type=self._normalize(brand.get_text(" ", strip=True) if brand else "Showroom"),
-            website=map_link.get("href") if map_link else None,
+            map_url=map_link.get("href") if map_link else None,
         )
         return record if record.is_valid() else None

@@ -357,7 +357,7 @@ class CromptonHandler(BaseBrandHandler):
                 if dealer_type
                 else "Authorized Dealer"
             ),
-            website=map_link.get("href") if map_link else None,
+            map_url=map_link.get("href") if map_link else None,
         )
         return record if record.is_valid() else None
 

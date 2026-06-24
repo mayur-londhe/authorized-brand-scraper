@@ -27,6 +27,7 @@ class DealerRecord:
     # --- Optional extras (drop or extend per brand) ---
     dealer_type: Optional[str] = None   # "Authorised Distributor", "Retailer", etc.
     website: Optional[str] = None
+    map_url: Optional[str] = None
     latitude: Optional[str] = None
     longitude: Optional[str] = None
 

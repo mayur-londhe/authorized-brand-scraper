@@ -16,6 +16,7 @@ class BaseBrandHandler(ABC):
     BRAND_NAME: str = ""          # e.g. "Crompton"
     SUPPORTED_CATEGORIES: list = []  # e.g. ["fans", "water heaters"]
     REQUIRES_CITY: bool = False
+    REQUIRES_PINCODE: bool = False
 
     def __init__(self, timeout: int = 15):
         self.timeout = timeout
