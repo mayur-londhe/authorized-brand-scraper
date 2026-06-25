@@ -5,6 +5,9 @@ import time
 from pathlib import Path
 from typing import List
 
+from bs4 import BeautifulSoup
+import requests
+
 from core.base_handler import BaseBrandHandler
 from core.schema import DealerRecord
 
@@ -16,6 +19,8 @@ class DrFixitHandler(BaseBrandHandler):
     REQUIRES_PINCODE = True
 
     LOCATOR_URL = "https://www.drfixit.co.in/locate/find-dealer"
+    CITY_URL = "https://www.drfixit.co.in/getcities"
+    DEALER_URL = "https://www.drfixit.co.in/get-dealer"
 
     def fetch(
         self, category: str, state: str, city: str = "", pincode: str = ""
@@ -25,6 +30,13 @@ class DrFixitHandler(BaseBrandHandler):
         pincode = self._normalize(pincode)
         if not state or not city or not pincode:
             raise ValueError("State, city, and pincode are required for Dr Fixit.")
+
+        try:
+            records = self._fetch_endpoint(category, state, city, pincode)
+            print(f"[Dr Fixit] Parsed {len(records)} dealer records from locator endpoint")
+            return records
+        except Exception as exc:
+            print(f"[Dr Fixit] Locator endpoint fallback failed: {type(exc).__name__}: {exc}")
 
         failures = []
         for headless in (True, False):
@@ -42,10 +54,86 @@ class DrFixitHandler(BaseBrandHandler):
             + " Diagnostic files: output/dr_fixit_error.png and output/dr_fixit_error.html"
         )
 
+    def _fetch_endpoint(
+        self, category: str, state: str, city: str, pincode: str
+    ) -> List[DealerRecord]:
+        session = requests.Session()
+        headers = {
+            **self.session_headers,
+            "Accept": "text/html,application/json,*/*",
+            "Referer": self.LOCATOR_URL,
+        }
+        page = session.get(self.LOCATOR_URL, headers=headers, timeout=self.timeout)
+        page.raise_for_status()
+        token = self._first_match(r'var token = "([^"]+)"', page.text)
+        if not token:
+            raise RuntimeError("Could not find Dr Fixit locator token.")
+
+        soup = BeautifulSoup(page.text, "html.parser")
+        state_id = self._find_option_value(soup, "state", state)
+        if not state_id:
+            raise RuntimeError(f"Could not find Dr Fixit state option for {state!r}.")
+
+        ajax_headers = {
+            **headers,
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        city_response = session.get(
+            self.CITY_URL,
+            params={"state_id": state_id, "_token": token},
+            headers=ajax_headers,
+            timeout=self.timeout,
+        )
+        city_response.raise_for_status()
+        city_id = self._find_city_id(city_response.json(), city)
+        if not city_id:
+            raise RuntimeError(f"Could not find Dr Fixit city option for {city!r}.")
+
+        records = []
+        seen_offsets = set()
+        offset = "0"
+        for _ in range(50):
+            if offset in seen_offsets:
+                break
+            seen_offsets.add(offset)
+            response = session.post(
+                self.DEALER_URL,
+                data={
+                    "offset": offset,
+                    "pincode": pincode,
+                    "state_id": state_id,
+                    "city_id": city_id,
+                    "_token": token,
+                },
+                headers=ajax_headers,
+                timeout=max(self.timeout, 20),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            html = payload.get("html_receive") or ""
+            for card in self._soup_cards(BeautifulSoup(html, "html.parser")):
+                record = self._parse_card(card, category, state, city, pincode)
+                if record is not None:
+                    records.append(record)
+
+            next_offset = self._next_offset(payload.get("btn_html") or "")
+            if not next_offset:
+                break
+            offset = next_offset
+
+        unique = []
+        seen = set()
+        for record in records:
+            key = (record.name.casefold(), record.address.casefold(), record.phone)
+            if key not in seen:
+                seen.add(key)
+                unique.append(record)
+        return unique
+
     def _scrape_browser(
         self, category: str, state: str, city: str, pincode: str, *, headless: bool
     ):
-        from bs4 import BeautifulSoup
         from selenium import webdriver
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support import expected_conditions as EC
@@ -146,7 +234,7 @@ class DrFixitHandler(BaseBrandHandler):
     @staticmethod
     def _soup_cards(soup):
         return [
-            card for card in soup.select("#request_list > *, .cards-wrapper > *")
+            card for card in soup.select(".card-box, #request_list > *, .cards-wrapper > *")
             if card.get_text(" ", strip=True)
         ]
 
@@ -207,7 +295,49 @@ class DrFixitHandler(BaseBrandHandler):
     @staticmethod
     def _first_match(pattern: str, text: str) -> str:
         match = re.search(pattern, text)
-        return match.group(0) if match else ""
+        if not match:
+            return ""
+        return match.group(1) if match.groups() else match.group(0)
+
+    @staticmethod
+    def _norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+
+    @classmethod
+    def _find_option_value(cls, soup, select_id: str, requested: str) -> str:
+        requested_norm = cls._norm(requested)
+        for option in soup.select(f"#{select_id} option"):
+            value = (option.get("value") or "").strip()
+            label = option.get_text(" ", strip=True)
+            value_norm = cls._norm(value)
+            label_norm = cls._norm(label)
+            if (
+                requested_norm in {value_norm, label_norm}
+                or bool(label_norm and requested_norm in label_norm)
+                or bool(label_norm and label_norm in requested_norm)
+            ):
+                return value
+        return ""
+
+    @classmethod
+    def _find_city_id(cls, cities, requested: str) -> str:
+        requested_norm = cls._norm(requested)
+        for city in cities or []:
+            value = str(city.get("id") or "").strip()
+            label = str(city.get("title") or "").strip()
+            label_norm = cls._norm(label)
+            if (
+                requested_norm == label_norm
+                or bool(label_norm and requested_norm in label_norm)
+                or bool(label_norm and label_norm in requested_norm)
+            ):
+                return value
+        return ""
+
+    @staticmethod
+    def _next_offset(html: str) -> str:
+        match = re.search(r'data-offset\s*=\s*["\']?(\d+)', html or "", re.I)
+        return match.group(1) if match else ""
 
     @staticmethod
     def _save_diagnostics(driver) -> None:

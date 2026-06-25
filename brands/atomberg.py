@@ -118,28 +118,33 @@ class AtombergHandler(BaseBrandHandler):
             stage = "loading Atomberg locator"
             driver.get(self.LOCATOR_URL)
             time.sleep(4)
-            self._close_modals(driver)
-            self._dismiss_blocking_contact_modal(driver)
             initial_signature = self._card_signature(driver)
 
             stage = f"typing pincode '{pincode}'"
             field = wait.until(lambda browser: self._pincode_field(browser))
             driver.execute_script(
-                "arguments[0].scrollIntoView({block:'center', inline:'nearest'});"
-                "arguments[0].focus(); arguments[0].click();",
+                """
+                const input = arguments[0];
+                const value = arguments[1];
+                input.scrollIntoView({block:'center', inline:'nearest'});
+                input.focus();
+                input.click();
+                const setter = Object.getOwnPropertyDescriptor(
+                  window.HTMLInputElement.prototype,
+                  'value'
+                ).set;
+                setter.call(input, value);
+                input.dispatchEvent(new Event('input', {bubbles:true}));
+                input.dispatchEvent(new Event('change', {bubbles:true}));
+                """,
                 field,
+                pincode,
             )
-            field.send_keys(Keys.CONTROL, "a")
-            field.send_keys(Keys.DELETE)
-            field.clear()
-            field.send_keys(pincode)
             if (field.get_attribute("value") or "").strip() != pincode:
-                driver.execute_script("arguments[0].value = arguments[1];", field, pincode)
-            driver.execute_script(
-                "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
-                "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
-                field,
-            )
+                field.send_keys(Keys.CONTROL, "a")
+                field.send_keys(Keys.DELETE)
+                field.clear()
+                field.send_keys(pincode)
             time.sleep(0.5)
 
             stage = "clicking Atomberg search button"
@@ -150,8 +155,6 @@ class AtombergHandler(BaseBrandHandler):
                 search,
             )
             time.sleep(1)
-            self._close_modals(driver)
-            self._dismiss_blocking_contact_modal(driver)
 
             stage = "waiting for Atomberg dealer cards"
             wait.until(
@@ -159,8 +162,6 @@ class AtombergHandler(BaseBrandHandler):
                     browser, initial_signature
                 )
             )
-            self._close_modals(driver)
-            self._dismiss_blocking_contact_modal(driver)
             time.sleep(2)
 
             records = self._parse_results(
@@ -395,7 +396,7 @@ class AtombergHandler(BaseBrandHandler):
 
     @classmethod
     def _cards_updated_or_present(cls, driver, initial_signature):
-        cards = cls._card_elements(driver)
+        cards = cls._store_card_snapshots(driver)
         if not cards:
             return False
         signature = cls._card_signature(driver)
@@ -405,9 +406,31 @@ class AtombergHandler(BaseBrandHandler):
 
     @classmethod
     def _dismiss_modal_and_get_cards(cls, driver, initial_signature):
-        cls._dismiss_blocking_contact_modal(driver)
         cls._close_contact_modal_with_script(driver)
         return cls._cards_updated_or_present(driver, initial_signature)
+
+    @classmethod
+    def _store_card_snapshots(cls, driver):
+        try:
+            return driver.execute_script(
+                """
+                const visible = (el) => {
+                  const rect = el.getBoundingClientRect();
+                  const style = window.getComputedStyle(el);
+                  return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                return [...document.querySelectorAll('li')]
+                  .filter((el) => {
+                    const text = el.innerText || el.textContent || '';
+                    return visible(el) && /Store Name:/i.test(text) && /Address:/i.test(text);
+                  })
+                  .map((el) => (el.innerText || el.textContent || '').trim())
+                  .filter(Boolean);
+                """
+            ) or []
+        except Exception:
+            return []
 
     @classmethod
     def _card_elements(cls, driver):
@@ -437,31 +460,37 @@ class AtombergHandler(BaseBrandHandler):
 
     @classmethod
     def _card_signature(cls, driver):
+        snapshots = cls._store_card_snapshots(driver)
+        if snapshots:
+            return tuple(text[:300] for text in snapshots[:5])
         return tuple(card.text.strip()[:300] for card in cls._card_elements(driver)[:5])
 
     @classmethod
     def _soup_cards(cls, soup):
-        for selector in cls.CARD_SELECTORS:
-            cards = [
-                card
-                for card in soup.select(selector)
-                if card.get_text(" ", strip=True)
-            ]
-            if cards:
-                return cards
         cards = []
         for label in soup.find_all(string=re.compile(r"Store Name:", re.I)):
             parent = label.parent
             for _ in range(6):
-                if parent is None:
+                if parent is None or parent.name in {"script", "style"}:
                     break
                 text = parent.get_text(" ", strip=True)
-                if "Address:" in text and "Phone:" in text:
+                if parent.name == "li" and "Address:" in text:
                     cards.append(parent)
                     break
                 parent = parent.parent
         if cards:
             return cards
+
+        for selector in cls.CARD_SELECTORS:
+            cards = [
+                card
+                for card in soup.select(selector)
+                if card.name not in {"script", "style"}
+                and "Store Name:" in card.get_text(" ", strip=True)
+                and "Address:" in card.get_text(" ", strip=True)
+            ]
+            if cards:
+                return cards
         return []
 
     @staticmethod
@@ -532,28 +561,21 @@ class AtombergHandler(BaseBrandHandler):
         from selenium.webdriver.common.by import By
 
         selectors = (
-            "button[aria-label='Close']",
-            "button[aria-label='close']",
-            ".btn-close",
-            ".modal .close",
-            ".modal button.close",
-            ".popup-close",
-            ".mfp-close",
-            "[data-dismiss='modal']",
-            "[data-bs-dismiss='modal']",
-            "button[id*='close']",
-            "button[class*='close']",
-            "button[id*='reject']",
-            "button[id*='decline']",
-            "svg[class*='close']",
-            "[class*='modal'] svg",
-            "[role='dialog'] svg",
+            "#headlessui-portal-root button.x-modal-close",
+            "#headlessui-portal-root [role='dialog'] button",
+            "[role='dialog'] button.x-modal-close",
         )
         for _ in range(4):
             closed = False
             for selector in selectors:
                 for element in driver.find_elements(By.CSS_SELECTOR, selector):
-                    if element.is_displayed():
+                    label = (
+                        element.text
+                        or element.get_attribute("aria-label")
+                        or element.get_attribute("title")
+                        or ""
+                    ).strip().casefold()
+                    if element.is_displayed() and label in {"x", "close"}:
                         driver.execute_script("arguments[0].click();", element)
                         time.sleep(0.7)
                         closed = True
@@ -573,11 +595,11 @@ class AtombergHandler(BaseBrandHandler):
                       return rect.width > 0 && rect.height > 0 &&
                         style.visibility !== 'hidden' && style.display !== 'none';
                     };
-                    const dialogs = [...document.querySelectorAll('[role="dialog"], .modal, [class*="modal"], body > div')]
+                    const dialogs = [...document.querySelectorAll('#headlessui-portal-root [role="dialog"], [role="dialog"]')]
                       .filter((el) => visible(el) && /share contact details|phone number|nearest store/i.test(el.innerText || ''));
                     let closed = false;
                     for (const dialog of dialogs) {
-                      const close = [...dialog.querySelectorAll('button, svg, span, div, a')]
+                      const close = [...dialog.querySelectorAll('button.x-modal-close, button')]
                         .find((el) => {
                           const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().toLowerCase();
                           const rect = el.getBoundingClientRect();
@@ -593,13 +615,6 @@ class AtombergHandler(BaseBrandHandler):
                       } else {
                         dialog.style.display = 'none';
                         dialog.setAttribute('aria-hidden', 'true');
-                        closed = true;
-                      }
-                    }
-                    for (const overlay of [...document.querySelectorAll('.modal-backdrop, .MuiBackdrop-root, [class*="overlay"], [class*="backdrop"]')]) {
-                      if (visible(overlay)) {
-                        overlay.style.display = 'none';
-                        overlay.setAttribute('aria-hidden', 'true');
                         closed = true;
                       }
                     }

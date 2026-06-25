@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from typing import List
 
+import requests
+
 from core.base_handler import BaseBrandHandler
 from core.schema import DealerRecord
 
@@ -15,8 +17,10 @@ class OrientHandler(BaseBrandHandler):
     REQUIRES_CITY = True
 
     LOCATOR_URL = "https://orientelectric.com/pages/store-locator"
+    SHEET_URL_ENDPOINT = "https://brand.orientelectric.com/api/getSheetUrl"
     PRODUCT_CATEGORY = "Fans"
     CITY_ALIASES = {"bengaluru": "BANGALORE", "bangalore": "BANGALORE"}
+    CONTROL_WAIT_TIMEOUT = 15
 
     def fetch(self, category: str, state: str, city: str = "") -> List[DealerRecord]:
         state = self._normalize(state)
@@ -24,6 +28,13 @@ class OrientHandler(BaseBrandHandler):
         if not state or not city:
             raise ValueError("State and city are required for Orient.")
         locator_city = self.CITY_ALIASES.get(city.casefold(), city)
+
+        try:
+            records = self._fetch_sheet_data(category, state, locator_city)
+            print(f"[Orient] Parsed {len(records)} dealer records from locator data")
+            return records
+        except Exception as exc:
+            print(f"[Orient] Locator data fallback failed: {type(exc).__name__}: {exc}")
 
         failures = []
         for headless in (True, False):
@@ -36,12 +47,72 @@ class OrientHandler(BaseBrandHandler):
                 message = str(exc).splitlines()[0].strip() or "browser timed out"
                 failures.append(f"{mode}: {type(exc).__name__}: {message}")
                 print(f"[Orient] {failures[-1]}")
+                if self._is_page_load_timeout(exc):
+                    break
 
         raise RuntimeError(
             "Orient browser scraper failed after headless and visible attempts. "
             + " | ".join(failures)
             + " Diagnostic files: output/orient_error.png and output/orient_error.html"
         )
+
+    def _fetch_sheet_data(
+        self, category: str, state: str, city: str
+    ) -> List[DealerRecord]:
+        response = requests.get(
+            self.SHEET_URL_ENDPOINT,
+            headers=self.session_headers,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        sheet_url = response.json().get("data")
+        if not sheet_url:
+            raise RuntimeError("Orient sheet URL was not returned.")
+
+        sheet_response = requests.get(
+            sheet_url,
+            headers=self.session_headers,
+            timeout=max(self.timeout, 30),
+        )
+        sheet_response.raise_for_status()
+        rows = sheet_response.json().get("values") or []
+        if len(rows) < 2:
+            return []
+
+        records = []
+        state_norm = self._norm(state)
+        city_norm = self._norm(city)
+        for row in rows[1:]:
+            row = list(row) + [""] * 11
+            row_category = row[1]
+            row_name = row[2]
+            row_state = row[3]
+            row_city = row[4]
+            row_address = row[8]
+            row_phone = row[10]
+
+            if self._norm(row_category) != self._norm(self.PRODUCT_CATEGORY):
+                continue
+            if self._norm(row_state) != state_norm:
+                continue
+            if self._norm(row_city) != city_norm:
+                continue
+
+            pincode_match = re.search(r"\b\d{6}\b", row_address or "")
+            record = self._make_record(
+                category=category,
+                state_name=state,
+                name=self._normalize(row_name),
+                phone=self._normalize(row_phone),
+                address=self._normalize(row_address),
+                city=self._normalize(row_city),
+                state=self._normalize(row_state),
+                pincode=pincode_match.group(0) if pincode_match else "",
+                dealer_type="Authorized Dealer",
+            )
+            if record.is_valid():
+                records.append(record)
+        return records
 
     def _scrape_browser(
         self, category: str, state: str, city: str, *, headless: bool
@@ -62,6 +133,11 @@ class OrientHandler(BaseBrandHandler):
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument(f"--user-agent={self.session_headers['User-Agent']}")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option(
+            "prefs",
+            {"profile.managed_default_content_settings.images": 2},
+        )
+        options.page_load_strategy = "none"
 
         driver = None
         stage = "starting Chrome"
@@ -69,11 +145,14 @@ class OrientHandler(BaseBrandHandler):
             mode = "headless" if headless else "visible"
             print(f"[Orient] Opening {mode} locator for {city}, {state}")
             driver = webdriver.Chrome(options=options)
-            wait = WebDriverWait(driver, max(self.timeout, 40))
+            wait = WebDriverWait(driver, min(max(self.timeout, 15), 22))
             stage = "loading the Orient locator"
             driver.get(self.LOCATOR_URL)
-            wait.until(EC.presence_of_element_located((By.ID, "new-slcatid")))
-            time.sleep(3)
+            WebDriverWait(driver, self.CONTROL_WAIT_TIMEOUT).until(
+                EC.presence_of_element_located((By.ID, "new-slcatid"))
+            )
+            driver.execute_script("window.stop();")
+            time.sleep(1)
             self._dismiss_consent(driver)
 
             stage = "selecting Fans product category"
@@ -98,7 +177,7 @@ class OrientHandler(BaseBrandHandler):
                 lambda browser: self._has_results(browser)
                 or self._no_results(browser)
             )
-            time.sleep(2)
+            time.sleep(0.5)
 
             soup = BeautifulSoup(driver.page_source, "html.parser")
             cards = soup.select(
@@ -135,7 +214,7 @@ class OrientHandler(BaseBrandHandler):
             for control in driver.find_elements(By.CSS_SELECTOR, selector):
                 if control.is_displayed():
                     driver.execute_script("arguments[0].click();", control)
-                    time.sleep(1)
+                    time.sleep(0.3)
                     return
 
     @staticmethod
@@ -152,7 +231,12 @@ class OrientHandler(BaseBrandHandler):
             ):
                 value = (option.get_attribute("value") or "").strip()
                 label = (option.get_attribute("textContent") or "").strip()
-                if requested.casefold() in {value.casefold(), label.casefold()}:
+                requested_norm = OrientHandler._norm(requested)
+                value_norm = OrientHandler._norm(value)
+                label_norm = OrientHandler._norm(label)
+                if OrientHandler._option_matches(
+                    requested_norm, value_norm, label_norm
+                ):
                     return option
             return False
 
@@ -165,6 +249,37 @@ class OrientHandler(BaseBrandHandler):
             select,
             value,
         )
+
+    @staticmethod
+    def _norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+
+    @staticmethod
+    def _option_matches(requested_norm: str, value_norm: str, label_norm: str) -> bool:
+        if not requested_norm:
+            return False
+        alias_map = {
+            "ka": "karnataka",
+            "mp": "madhya pradesh",
+            "mh": "maharashtra",
+            "tn": "tamil nadu",
+            "up": "uttar pradesh",
+            "wb": "west bengal",
+        }
+        requested_alias = alias_map.get(requested_norm, requested_norm)
+        return (
+            requested_norm in {value_norm, label_norm}
+            or requested_alias == label_norm
+            or bool(label_norm and requested_norm in label_norm)
+            or bool(label_norm and label_norm in requested_norm)
+            or bool(value_norm and requested_norm in value_norm)
+            or bool(value_norm and value_norm in requested_norm)
+        )
+
+    @staticmethod
+    def _is_page_load_timeout(exc: Exception) -> bool:
+        text = str(exc).casefold()
+        return "err_connection_timed_out" in text or "timed out receiving message" in text
 
     @staticmethod
     def _has_results(driver) -> bool:

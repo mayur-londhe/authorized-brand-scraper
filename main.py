@@ -159,7 +159,7 @@ Examples:
     # ── Export ────────────────────────────────────────────────────────
     filename = args.output or export_filename(args.category, args.city, args.pincode)
     out_path = export_to_xlsx(records, OUTPUT_DIR, filename=filename)
-    print(f"\n✓ Done. Output saved to: {out_path}")
+    print(f"\nDone. Output saved to: {out_path}")
 
 
 if __name__ == "__main__":

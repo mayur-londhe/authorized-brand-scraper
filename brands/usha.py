@@ -14,17 +14,24 @@ from core.schema import DealerRecord
 class UshaHandler(BaseBrandHandler):
     BRAND_NAME = "Usha"
     SUPPORTED_CATEGORIES = ["high efficient fans", "fans"]
+    REQUIRES_CITY = True
 
     LOCATOR_URL = "https://ushafans.com/find-city-store"
-    LOCATOR_CITY = "Bangalore"
+    CITY_ALIASES = {"bengaluru": "Bangalore", "bangalore": "Bangalore"}
 
     def fetch(self, category: str, state: str, city: str = "") -> List[DealerRecord]:
-        """Select Bangalore only; leave the store-type dropdown at its default."""
+        """Select the requested city; leave the store-type dropdown at its default."""
+        requested_state = self._normalize(state)
+        requested_city = self._normalize(city)
+        if not requested_city:
+            raise ValueError("City is required for Usha.")
+        locator_city = self.CITY_ALIASES.get(requested_city.casefold(), requested_city)
+
         failures = []
         for headless in (True, False):
             try:
                 return self._scrape_browser(
-                    category, self._normalize(state), headless=headless
+                    category, requested_state, locator_city, headless=headless
                 )
             except Exception as exc:
                 mode = "headless" if headless else "visible"
@@ -38,12 +45,12 @@ class UshaHandler(BaseBrandHandler):
         )
 
     def _scrape_browser(
-        self, category: str, requested_state: str, *, headless: bool
+        self, category: str, requested_state: str, city: str, *, headless: bool
     ) -> List[DealerRecord]:
         from selenium import webdriver
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support import expected_conditions as EC
-        from selenium.webdriver.support.ui import Select, WebDriverWait
+        from selenium.webdriver.support.ui import WebDriverWait
 
         options = webdriver.ChromeOptions()
         if headless:
@@ -60,23 +67,21 @@ class UshaHandler(BaseBrandHandler):
         stage = "starting Chrome"
         try:
             driver = webdriver.Chrome(options=options)
-            wait = WebDriverWait(driver, max(self.timeout, 35))
+            wait = WebDriverWait(driver, min(max(self.timeout, 15), 25))
             stage = "loading the Usha locator"
             driver.get(self.LOCATOR_URL)
-            city_select = wait.until(
-                EC.presence_of_element_located((By.ID, "str_city_new"))
-            )
+            wait.until(EC.presence_of_element_located((By.ID, "str_city_new")))
 
-            stage = "selecting Bangalore"
-            Select(city_select).select_by_visible_text(self.LOCATOR_CITY)
+            stage = f"selecting city '{city}'"
+            self._select_value(driver, wait, "str_city_new", city)
             wait.until(self._results_loaded)
-            time.sleep(2)
+            time.sleep(0.5)
 
             records = self._parse_results(
-                driver.page_source, category, requested_state
+                driver.page_source, category, requested_state, city
             )
             print(
-                f"[Usha] Scraped {len(records)} Bangalore stores "
+                f"[Usha] Scraped {len(records)} {city} stores "
                 "without selecting a store type"
             )
             return records
@@ -102,7 +107,7 @@ class UshaHandler(BaseBrandHandler):
         )
 
     def _parse_results(
-        self, html: str, category: str, requested_state: str
+        self, html: str, category: str, requested_state: str, city: str
     ) -> List[DealerRecord]:
         soup = BeautifulSoup(html, "html.parser")
         records = []
@@ -128,7 +133,7 @@ class UshaHandler(BaseBrandHandler):
                 name=self._normalize(name),
                 phone=self._normalize(phone),
                 address=self._normalize(address),
-                city=self.LOCATOR_CITY,
+                city=city,
                 state=state,
                 pincode=pincode.group(0) if pincode else "",
                 dealer_type="Usha Store",
@@ -136,6 +141,43 @@ class UshaHandler(BaseBrandHandler):
             if record.is_valid():
                 records.append(record)
         return records
+
+    @staticmethod
+    def _select_value(driver, wait, select_id: str, requested: str) -> None:
+        from selenium.webdriver.common.by import By
+
+        select = wait.until(lambda browser: browser.find_element(By.ID, select_id))
+        requested_norm = UshaHandler._norm(requested)
+
+        def matching_option(browser):
+            for option in browser.find_elements(By.CSS_SELECTOR, f"#{select_id} option"):
+                value = (option.get_attribute("value") or "").strip()
+                label = (option.get_attribute("textContent") or "").strip()
+                value_norm = UshaHandler._norm(value)
+                label_norm = UshaHandler._norm(label)
+                if (
+                    requested_norm in {value_norm, label_norm}
+                    or bool(label_norm and requested_norm in label_norm)
+                    or bool(label_norm and label_norm in requested_norm)
+                    or bool(value_norm and requested_norm in value_norm)
+                    or bool(value_norm and value_norm in requested_norm)
+                ):
+                    return option
+            return False
+
+        option = wait.until(matching_option)
+        value = option.get_attribute("value")
+        driver.execute_script(
+            "arguments[0].value=arguments[1];"
+            "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+            "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
+            select,
+            value,
+        )
+
+    @staticmethod
+    def _norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
 
     @staticmethod
     def _save_diagnostics(driver) -> None:

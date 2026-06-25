@@ -102,6 +102,9 @@ class VGuardHandler(BaseBrandHandler):
 
             stage = f"selecting district '{district}'"
             self._select_by_value_or_text(driver, district_select, district)
+            driver.execute_script(
+                "if (typeof showLocations === 'function') { showLocations(1); }"
+            )
 
             stage = "waiting for V-Guard dealer cards"
             wait.until(lambda browser: self._locations_ready(browser))
@@ -115,11 +118,8 @@ class VGuardHandler(BaseBrandHandler):
             while True:
                 soup = BeautifulSoup(driver.page_source, "html.parser")
                 page_records = self._parse_locations(soup, category, state, district)
-                page_signature = tuple(
-                    (record.name, record.address, record.phone)
-                    for record in page_records[:6]
-                )
-                if not page_records or page_signature in seen_pages:
+                page_signature = tuple(self._locations_snapshot(driver)[:6])
+                if not page_signature or page_signature in seen_pages:
                     break
                 seen_pages.add(page_signature)
 
@@ -142,14 +142,21 @@ class VGuardHandler(BaseBrandHandler):
                 next_page = self._next_page_number(driver)
                 if next_page is None:
                     break
-                old_signature = self._live_signature(driver)
-                driver.execute_script("showLocations(arguments[0]);", next_page)
-                wait.until(
-                    lambda browser: self._live_signature(browser) != old_signature
-                )
-                wait.until(lambda browser: self._locations_ready(browser))
-                time.sleep(1)
-                page = next_page
+                try:
+                    old_signature = self._live_signature(driver)
+                    driver.execute_script("showLocations(arguments[0]);", next_page)
+                    wait.until(
+                        lambda browser: self._live_signature(browser) != old_signature
+                    )
+                    wait.until(lambda browser: self._locations_ready(browser))
+                    time.sleep(1)
+                    page = next_page
+                except Exception as page_exc:
+                    print(
+                        "[V-Guard] Stopping pagination after rendered results: "
+                        f"{type(page_exc).__name__}: {str(page_exc).splitlines()[0]}"
+                    )
+                    break
 
             print(f"[V-Guard] Parsed {len(records)} dealer cards")
             return records
@@ -183,6 +190,9 @@ class VGuardHandler(BaseBrandHandler):
         name = name_node.get_text(" ", strip=True)
 
         text = cell.get_text("\n", strip=True)
+        if self._norm(district) not in self._norm(text):
+            return None
+
         products = self._field(text, r"Products:\s*([^\n]+)")
         if self._is_fans_category(category) and "fan" not in products.casefold():
             return None
@@ -270,13 +280,18 @@ class VGuardHandler(BaseBrandHandler):
         for option in options:
             value = (option.get_attribute("value") or "").strip()
             label = (option.text or option.get_attribute("textContent") or "").strip()
-            if requested == value or requested_norm == VGuardHandler._norm(label):
+            value_norm = VGuardHandler._norm(value)
+            label_norm = VGuardHandler._norm(label)
+            if VGuardHandler._option_matches(requested_norm, value_norm, label_norm):
                 matching = option
                 break
         if matching is None:
             for option in options:
+                value = (option.get_attribute("value") or "").strip()
                 label = (option.text or option.get_attribute("textContent") or "").strip()
-                if requested_norm and requested_norm in VGuardHandler._norm(label):
+                value_norm = VGuardHandler._norm(value)
+                label_norm = VGuardHandler._norm(label)
+                if VGuardHandler._option_matches(requested_norm, value_norm, label_norm):
                     matching = option
                     break
         if matching is None:
@@ -327,10 +342,8 @@ class VGuardHandler(BaseBrandHandler):
                 """
                 const root = document.querySelector('#locations');
                 if (!root) return [];
-                const style = window.getComputedStyle(root);
-                if (style.display === 'none' || style.visibility === 'hidden') return [];
                 return [...root.querySelectorAll("table td[valign='top']")]
-                  .map((cell) => (cell.innerText || '').trim())
+                  .map((cell) => (cell.innerText || cell.textContent || '').trim())
                   .filter(Boolean);
                 """
             ) or []
@@ -405,6 +418,49 @@ class VGuardHandler(BaseBrandHandler):
     @staticmethod
     def _norm(value: str) -> str:
         return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+
+    @staticmethod
+    def _option_matches(requested_norm: str, value_norm: str, label_norm: str) -> bool:
+        if not requested_norm:
+            return False
+        label_initials = "".join(part[:1] for part in label_norm.split())
+        alias_map = {
+            "ap": "andhra pradesh",
+            "ar": "arunachal pradesh",
+            "as": "assam",
+            "br": "bihar",
+            "cg": "chhattisgarh",
+            "ch": "chandigarh",
+            "dl": "delhi",
+            "ga": "goa",
+            "gj": "gujarat",
+            "hr": "haryana",
+            "hp": "himachal pradesh",
+            "jh": "jharkhand",
+            "jk": "jammu and kashmir",
+            "ka": "karnataka",
+            "kl": "kerala",
+            "mh": "maharashtra",
+            "mp": "madhya pradesh",
+            "od": "odisha",
+            "or": "odisha",
+            "pb": "punjab",
+            "rj": "rajasthan",
+            "tn": "tamil nadu",
+            "ts": "telangana",
+            "up": "uttar pradesh",
+            "uk": "uttarakhand",
+            "wb": "west bengal",
+        }
+        requested_alias = alias_map.get(requested_norm, requested_norm)
+        return (
+            requested_norm in {value_norm, label_norm, label_initials}
+            or requested_alias == label_norm
+            or bool(label_norm and requested_norm in label_norm)
+            or bool(label_norm and label_norm in requested_norm)
+            or bool(value_norm and requested_norm in value_norm)
+            or bool(value_norm and value_norm in requested_norm)
+        )
 
     @staticmethod
     def _save_diagnostics(driver) -> None:

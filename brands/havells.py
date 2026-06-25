@@ -163,10 +163,13 @@ class HavellsHandler(BaseBrandHandler):
                     (By.ID, "store_locator_filter_submit")
                 )
             )
-            driver.execute_script("arguments[0].click();", submit)
+            driver.execute_script(
+                "arguments[0].click();"
+                "if (window.jQuery) { jQuery(arguments[0]).trigger('click'); }",
+                submit,
+            )
             wait.until(
-                lambda browser: self._result_signature(browser)
-                != initial_signature
+                lambda browser: self._results_ready(browser, initial_signature)
             )
             time.sleep(2)
 
@@ -201,17 +204,18 @@ class HavellsHandler(BaseBrandHandler):
         """Wait for an AJAX-populated option, set it, and dispatch change."""
         from selenium.webdriver.common.by import By
 
-        select = wait.until(
-            lambda browser: browser.find_element(By.ID, select_id)
-        )
-
         def matching_option(browser):
+            requested_norm = HavellsHandler._norm(requested)
             for option in browser.find_elements(
-                By.CSS_SELECTOR, f"#{select_id} option"
+                By.CSS_SELECTOR, f"#store_locator_filter #{select_id} option"
             ):
                 value = (option.get_attribute("value") or "").strip()
                 label = (option.get_attribute("textContent") or "").strip()
-                if requested.casefold() in {value.casefold(), label.casefold()}:
+                value_norm = HavellsHandler._norm(value)
+                label_norm = HavellsHandler._norm(label)
+                if HavellsHandler._option_matches(
+                    requested_norm, value_norm, label_norm
+                ):
                     return option
             return False
 
@@ -224,7 +228,7 @@ class HavellsHandler(BaseBrandHandler):
                 "const option=document.createElement('option');"
                 "option.value=arguments[1]; option.text=arguments[1];"
                 "arguments[0].appendChild(option);",
-                select,
+                wait.until(lambda browser: HavellsHandler._filter_select(browser, select_id)),
                 requested,
             )
             option = matching_option(driver)
@@ -233,11 +237,84 @@ class HavellsHandler(BaseBrandHandler):
                     f"Could not add {requested!r} to #{select_id}"
                 )
         value = option.get_attribute("value")
+        select = wait.until(lambda browser: HavellsHandler._filter_select(browser, select_id))
         driver.execute_script(
             "arguments[0].value=arguments[1];"
+            "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
             "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
             select,
             value,
+        )
+        driver.execute_script(
+            "if (window.jQuery) {"
+            "  jQuery(arguments[0]).val(arguments[1]).trigger('input').trigger('change');"
+            "}",
+            select,
+            value,
+        )
+        driver.execute_script(
+            "arguments[0].value=arguments[1];"
+            "if (window.jQuery) { jQuery(arguments[0]).val(arguments[1]); }",
+            select,
+            value,
+        )
+
+    @staticmethod
+    def _filter_select(driver, select_id: str):
+        from selenium.webdriver.common.by import By
+
+        for select in driver.find_elements(
+            By.CSS_SELECTOR, f"#store_locator_filter #{select_id}"
+        ):
+            if select.is_enabled():
+                return select
+        return False
+
+    @staticmethod
+    def _norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+
+    @staticmethod
+    def _option_matches(requested_norm: str, value_norm: str, label_norm: str) -> bool:
+        if not requested_norm:
+            return False
+        label_initials = "".join(part[:1] for part in label_norm.split())
+        alias_map = {
+            "ap": "andhra pradesh",
+            "ar": "arunachal pradesh",
+            "as": "assam",
+            "br": "bihar",
+            "cg": "chhattisgarh",
+            "ch": "chandigarh",
+            "dl": "delhi",
+            "ga": "goa",
+            "gj": "gujarat",
+            "hr": "haryana",
+            "hp": "himachal pradesh",
+            "jh": "jharkhand",
+            "jk": "jammu and kashmir",
+            "ka": "karnataka",
+            "kl": "kerala",
+            "mh": "maharashtra",
+            "mp": "madhya pradesh",
+            "od": "odisha",
+            "or": "odisha",
+            "pb": "punjab",
+            "rj": "rajasthan",
+            "tn": "tamil nadu",
+            "ts": "telangana",
+            "up": "uttar pradesh",
+            "uk": "uttarakhand",
+            "wb": "west bengal",
+        }
+        requested_alias = alias_map.get(requested_norm, requested_norm)
+        return (
+            requested_norm in {value_norm, label_norm, label_initials}
+            or requested_alias == label_norm
+            or bool(label_norm and requested_norm in label_norm)
+            or bool(label_norm and label_norm in requested_norm)
+            or bool(value_norm and requested_norm in value_norm)
+            or bool(value_norm and value_norm in requested_norm)
         )
 
     @staticmethod
@@ -250,6 +327,24 @@ class HavellsHandler(BaseBrandHandler):
                 By.CSS_SELECTOR, "#store_locator_list > div"
             )[:3]
         )
+
+    @classmethod
+    def _results_ready(cls, driver, initial_signature):
+        signature = cls._result_signature(driver)
+        if signature and signature != initial_signature:
+            return signature
+        try:
+            text = driver.execute_script(
+                """
+                const root = document.querySelector('#store_locator_list');
+                return root ? (root.innerText || root.textContent || '').trim() : '';
+                """
+            ) or ""
+        except Exception:
+            text = ""
+        if text and "no record found" in text.casefold():
+            return text
+        return False
 
     def _parse_card(self, card, category: str, state: str, city: str, store_type: str):
         name = card.select_one("h5")
