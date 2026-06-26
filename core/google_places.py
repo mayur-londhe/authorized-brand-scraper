@@ -54,8 +54,10 @@ def get_place_display_name(place: dict) -> str:
 
 
 def is_company_match(company_name: str, place_name: str) -> bool:
-    """Return True only when the names match exactly, ignoring case/spacing."""
-    return bool(_clean_text(company_name)) and _clean_text(company_name) == _clean_text(place_name)
+    """Return True when the scraped company name appears in the Google place name."""
+    company = _clean_text(company_name)
+    place = _clean_text(place_name)
+    return bool(company and place) and company in place
 
 
 def _safe_float(value, default: float = 0.0) -> float:
