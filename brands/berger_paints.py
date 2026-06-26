@@ -398,20 +398,7 @@ class BergerPaintsHandler(BaseBrandHandler):
         email = self._first_match(r"[\w.+-]+@[\w.-]+\.\w+", text)
         pincode = self._first_match(r"\b[1-9]\d{5}\b", text)
         map_link = card.select_one("a[href*='maps'], a[href*='google']")
-        ignored = {
-            name.casefold(),
-            phone.casefold(),
-            email.casefold(),
-            "get direction",
-            "get directions",
-            "direction",
-            "distance -",
-        }
-        address = ", ".join(
-            line for line in lines[1:]
-            if line.casefold() not in ignored
-            and not re.search(r"\b\d+(?:\.\d+)?\s*km\b", line, re.IGNORECASE)
-        )
+        address = ", ".join(self._address_lines(lines[1:], name, phone, email))
 
         record = self._make_record(
             category=category,
@@ -441,6 +428,40 @@ class BergerPaintsHandler(BaseBrandHandler):
     def _first_match(pattern: str, text: str) -> str:
         match = re.search(pattern, text)
         return match.group(0) if match else ""
+
+    @classmethod
+    def _address_lines(cls, lines, name: str, phone: str, email: str) -> list[str]:
+        ignored_exact = {
+            name.casefold(),
+            phone.casefold(),
+            email.casefold(),
+            "address",
+            "get direction",
+            "get directions",
+            "directions",
+            "direction",
+            "distance -",
+            "view details",
+            "call",
+            "phone",
+            "contact",
+        }
+        cleaned = []
+        for line in lines:
+            value = re.sub(r"\s+", " ", str(line or "")).strip(" ,:-")
+            lower = value.casefold()
+            if not value or lower in ignored_exact:
+                continue
+            if cls._first_match(r"(?:\+91[\s-]?)?[6-9]\d{9}", value):
+                continue
+            if cls._first_match(r"[\w.+-]+@[\w.-]+\.\w+", value):
+                continue
+            if re.search(r"\b\d+(?:\.\d+)?\s*km\b", value, re.IGNORECASE):
+                continue
+            if any(token in lower for token in ("get direction", "view detail", "call now", "open now", "closed now")):
+                continue
+            cleaned.append(value)
+        return cleaned
 
     @staticmethod
     def _save_diagnostics(driver) -> None:

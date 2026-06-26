@@ -6,6 +6,7 @@ import inspect
 import os
 from pathlib import Path
 import re
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 import openpyxl
@@ -19,6 +20,8 @@ from core import (
     google_maps_url,
     pincode_from_address,
     records_with_duplicate_status,
+    records_without_duplicates,
+    verify_records_with_google,
 )
 from core.s3_storage import S3Storage
 
@@ -71,6 +74,15 @@ def export_filename(category: str, city: str = "", pincode: str = "") -> str:
     return "_".join(part for part in parts if part and part != "dealers") + ".xlsx"
 
 
+def google_terms_for_category(category: str) -> str:
+    category_key = str(category or "").casefold()
+    if "fan" in category_key:
+        return "fans"
+    if "cool" in category_key or "roof" in category_key or "paint" in category_key:
+        return "paint"
+    return "bathroom fitting sanitaryware"
+
+
 def fetch_records(handler, category: str, state: str, city: str, pincode: str = ""):
     kwargs = {"category": category, "state": state, "city": city}
     if "pincode" in inspect.signature(handler.fetch).parameters:
@@ -78,11 +90,9 @@ def fetch_records(handler, category: str, state: str, city: str, pincode: str = 
     return handler.fetch(**kwargs)
 
 
-DISPLAY_COLUMNS = {
-    "duplicate_status": "Duplicate Status",
+BASE_DISPLAY_COLUMNS = {
     "source_brand": "Source Brand",
     "category": "Category",
-    "state_name": "State Query",
     "name": "Dealer Name",
     "phone": "Phone",
     "email": "Email",
@@ -93,11 +103,32 @@ DISPLAY_COLUMNS = {
     "dealer_type": "Dealer Type",
     "website": "Website",
     "map_url": "Google Maps",
-    "latitude": "Latitude",
-    "longitude": "Longitude",
+}
+
+GOOGLE_DISPLAY_COLUMNS = {
+    "google_name": "Google Name",
+    "google_full_address": "Google Full Address",
+    "google_contact_number": "Google Contact Number",
+    "google_rating": "Google Rating",
+    "google_reviews": "Google Reviews",
+    "google_business_type": "Google Business Type",
+    "google_business_status": "Google Business Status",
+    "google_location": "Google Location",
+    "google_score": "Google Score",
 }
 
 DUPLICATE_STATUS_COLUMN = "Duplicate Status"
+HIDDEN_OUTPUT_COLUMNS = {
+    "Duplicate Status",
+    "State Query",
+    "Latitude",
+    "Longitude",
+    "Google Verified",
+    "Google Place ID",
+    "Google Get Directions",
+    "Google Directions",
+}
+GOOGLE_OUTPUT_COLUMNS = set(GOOGLE_DISPLAY_COLUMNS.values())
 
 
 def is_duplicate_status(value) -> bool:
@@ -177,17 +208,15 @@ def add_duplicate_status_if_possible(dataframe: pd.DataFrame) -> pd.DataFrame:
     if DUPLICATE_STATUS_COLUMN in dataframe.columns:
         return dataframe
 
-    name_column = find_column(dataframe, {"dealer name", "name"})
     address_column = find_column(dataframe, {"address"})
-    if not name_column or not address_column:
+    if not address_column:
         return dataframe
 
     keys = []
     counts = {}
     for _, row in dataframe.iterrows():
-        name = normalized_text(row.get(name_column, ""))
         address = normalized_text(row.get(address_column, ""))
-        key = (name, address) if name and address else None
+        key = address if address else None
         keys.append(key)
         if key is not None:
             counts[key] = counts.get(key, 0) + 1
@@ -211,36 +240,53 @@ def add_duplicate_status_if_possible(dataframe: pd.DataFrame) -> pd.DataFrame:
 
 
 def render_duplicate_dataframe(dataframe: pd.DataFrame, preview_limit: int | None = None) -> None:
+    dataframe = drop_empty_rows(dataframe)
     dataframe = enrich_location_columns(dataframe)
+    dataframe = ensure_google_link_columns(dataframe)
+    dataframe = drop_empty_google_columns(dataframe)
     dataframe = add_duplicate_status_if_possible(dataframe)
+    duplicate_mask = (
+        dataframe[DUPLICATE_STATUS_COLUMN].map(is_duplicate_status)
+        if DUPLICATE_STATUS_COLUMN in dataframe.columns
+        else pd.Series(False, index=dataframe.index)
+    )
     if DUPLICATE_STATUS_COLUMN in dataframe.columns:
-        duplicate_count = dataframe[DUPLICATE_STATUS_COLUMN].map(is_duplicate_status).sum()
+        duplicate_count = duplicate_mask.sum()
         not_duplicate_count = len(dataframe) - duplicate_count
         st.caption(
             f"Not duplicate: {not_duplicate_count} | Duplicate rows: {duplicate_count}"
         )
 
     def mark_duplicates(row):
-        if is_duplicate_status(row.get(DUPLICATE_STATUS_COLUMN, "")):
+        if bool(duplicate_mask.get(row.name, False)):
             return ["background-color: #f4cccc; color: #990000"] * len(row)
         return [""] * len(row)
 
     if preview_limit is not None:
         st.caption(f"Previewing up to {preview_limit} rows")
 
-    table = (
-        dataframe.style.apply(mark_duplicates, axis=1)
-        if DUPLICATE_STATUS_COLUMN in dataframe.columns
-        else dataframe
+    visible_dataframe = dataframe.drop(
+        columns=[column for column in HIDDEN_OUTPUT_COLUMNS if column in dataframe.columns]
     )
     column_config = {}
-    if "Google Maps" in dataframe.columns:
+    if "Google Maps" in visible_dataframe.columns:
         column_config["Google Maps"] = st.column_config.LinkColumn(
             "Google Maps",
             display_text="Open Map",
         )
-    if "Website" in dataframe.columns:
+    if "Google Location" in visible_dataframe.columns:
+        column_config["Google Location"] = st.column_config.LinkColumn(
+            "Google Location",
+            display_text="Open Map",
+        )
+    if "Website" in visible_dataframe.columns:
         column_config["Website"] = st.column_config.LinkColumn("Website")
+
+    link_columns = {"Google Maps", "Google Location", "Website"}
+    if link_columns & set(visible_dataframe.columns):
+        table = visible_dataframe
+    else:
+        table = visible_dataframe.style.apply(mark_duplicates, axis=1)
 
     st.dataframe(
         table,
@@ -250,12 +296,173 @@ def render_duplicate_dataframe(dataframe: pd.DataFrame, preview_limit: int | Non
     )
 
 
+def dataframe_without_duplicate_rows(dataframe: pd.DataFrame) -> pd.DataFrame:
+    annotated = add_duplicate_status_if_possible(
+        drop_empty_rows(drop_empty_google_columns(dataframe))
+    )
+    if DUPLICATE_STATUS_COLUMN not in annotated.columns:
+        return dataframe.drop(
+            columns=[column for column in HIDDEN_OUTPUT_COLUMNS if column in dataframe.columns]
+        )
+    duplicate_statuses = annotated[DUPLICATE_STATUS_COLUMN].astype(str)
+    keep_rows = ~duplicate_statuses.str.startswith("Duplicate (same as row")
+    deduped = annotated.loc[keep_rows]
+    return deduped.drop(
+        columns=[column for column in HIDDEN_OUTPUT_COLUMNS if column in deduped.columns]
+    )
+
+
+def dataframe_with_download_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
+    enriched = enrich_location_columns(dataframe)
+    enriched = ensure_google_link_columns(enriched)
+    enriched = drop_empty_google_columns(enriched)
+    enriched = drop_empty_rows(enriched)
+    return enriched.drop(
+        columns=[column for column in HIDDEN_OUTPUT_COLUMNS if column in enriched.columns]
+    )
+
+
+def drop_empty_rows(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe.empty:
+        return dataframe
+    cleaned = dataframe.replace(r"^\s*$", pd.NA, regex=True)
+    return cleaned.dropna(how="all").fillna("")
+
+
+def ensure_google_link_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
+    enriched = dataframe.copy()
+    address_column = find_column(enriched, {"google full address"})
+    name_column = find_column(enriched, {"google name"})
+    location_column = find_column(enriched, {"google location"})
+
+    if not address_column and not name_column:
+        return enriched
+
+    def destination(row) -> str:
+        address = row.get(address_column, "") if address_column else ""
+        name = row.get(name_column, "") if name_column else ""
+        return str(address or name or "").strip()
+
+    if not location_column:
+        enriched["Google Location"] = ""
+        location_column = "Google Location"
+    enriched[location_column] = enriched.apply(
+        lambda row: (
+            f"https://www.google.com/maps/search/?api=1&query={quote_plus(destination(row))}"
+            if blank_cell(row.get(location_column, "")) and destination(row)
+            else row.get(location_column, "")
+        ),
+        axis=1,
+    )
+
+    return enriched
+
+
+def dataframe_to_xlsx_bytes(dataframe: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Dealer Logbook"
+    for col_index, column in enumerate(dataframe.columns, start=1):
+        sheet.cell(row=1, column=col_index, value=str(column))
+    for row_index, (_, row) in enumerate(dataframe.iterrows(), start=2):
+        for col_index, value in enumerate(row, start=1):
+            sheet.cell(row=row_index, column=col_index, value="" if pd.isna(value) else value)
+    workbook.save(output)
+    return output.getvalue()
+
+
+def saved_file_download_payload(key: str, data: bytes, without_duplicates: bool) -> tuple[bytes, str, str]:
+    suffix = Path(key).suffix.casefold()
+    name = Path(key).name
+    stem = Path(key).stem
+    if suffix == ".xlsx":
+        workbook = openpyxl.load_workbook(BytesIO(data), read_only=True, data_only=True)
+        rows = list(workbook.active.iter_rows(values_only=True))
+        if not rows:
+            return data, name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        headers = [str(value or "") for value in rows[0]]
+        dataframe = pd.DataFrame([dict(zip(headers, row)) for row in rows[1:]])
+        clean_dataframe = (
+            dataframe_without_duplicate_rows(dataframe)
+            if without_duplicates
+            else dataframe_with_download_columns(dataframe)
+        )
+        download_name = f"{stem}_without_duplicates.xlsx" if without_duplicates else name
+        return (
+            dataframe_to_xlsx_bytes(clean_dataframe),
+            download_name,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    if suffix == ".csv":
+        dataframe = pd.read_csv(BytesIO(data))
+        clean_dataframe = (
+            dataframe_without_duplicate_rows(dataframe)
+            if without_duplicates
+            else dataframe_with_download_columns(dataframe)
+        )
+        download_name = f"{stem}_without_duplicates.csv" if without_duplicates else name
+        return (
+            clean_dataframe.to_csv(index=False).encode("utf-8"),
+            download_name,
+            "text/csv",
+        )
+    return data, name, "application/octet-stream"
+
+
+def drop_empty_google_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
+    google_columns = [
+        column for column in GOOGLE_OUTPUT_COLUMNS
+        if column in dataframe.columns
+        and dataframe[column].map(lambda value: not blank_cell(value)).sum() == 0
+    ]
+    if not google_columns:
+        return dataframe
+    return dataframe.drop(columns=google_columns)
+
+
+def display_columns_for_records(records) -> dict:
+    has_google_data = any(record.google_verified is not None for record in records)
+    return (
+        {**BASE_DISPLAY_COLUMNS, **GOOGLE_DISPLAY_COLUMNS}
+        if has_google_data
+        else BASE_DISPLAY_COLUMNS
+    )
+
+
 def render_records_table(records) -> None:
     rows = records_with_duplicate_status(records)
     dataframe = pd.DataFrame(rows)
-    dataframe = dataframe[[column for column in DISPLAY_COLUMNS if column in dataframe.columns]]
-    dataframe = dataframe.rename(columns=DISPLAY_COLUMNS)
+    display_columns = display_columns_for_records(records)
+    dataframe = dataframe[[column for column in display_columns if column in dataframe.columns]]
+    dataframe = dataframe.rename(columns=display_columns)
     render_duplicate_dataframe(dataframe)
+
+
+def records_download_dataframe(records) -> pd.DataFrame:
+    rows = records_with_duplicate_status(records)
+    dataframe = pd.DataFrame(rows)
+    display_columns = display_columns_for_records(records)
+    dataframe = dataframe[[column for column in display_columns if column in dataframe.columns]]
+    dataframe = dataframe.rename(columns=display_columns)
+    return enrich_location_columns(dataframe)
+
+
+def save_records_to_shared_files(
+    records,
+    *,
+    filename: str,
+    bucket_name: str,
+) -> tuple[Path, str | None, str | None]:
+    output_path = export_to_xlsx(records, OUTPUT_DIR, filename)
+    if not bucket_name:
+        return output_path, None, None
+    try:
+        storage = load_storage(bucket_name, active_region())
+        key = storage.upload_path(output_path, key=f"exports/{filename}")
+        return output_path, key, None
+    except Exception as exc:
+        return output_path, None, str(exc)
 
 
 def render_scraper_dashboard(registry: PluginRegistry) -> None:
@@ -266,7 +473,7 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
     missing = [name for name in configured if registry.get(name) is None]
 
     if not brands:
-        st.warning("No scraper plugins are available for this category yet.")
+        st.warning("No sources are available for this category yet.")
         if missing:
             st.caption("Configured, but not implemented: " + ", ".join(missing))
         return
@@ -299,70 +506,158 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
     bucket_name = active_bucket_name()
     upload_to_s3 = bool(bucket_name)
 
-    if not st.button("Run scrapers", type="primary", use_container_width=True):
+    scrape_signature = {
+        "category": category,
+        "scraper_category": scraper_category,
+        "brands": tuple(selected_brands),
+        "state": state.strip(),
+        "city": city.strip(),
+        "pincode": pincode.strip(),
+    }
+
+    if st.button("Run", type="primary", use_container_width=True):
+        errors: list[str] = []
+        records = []
+        if not selected_brands:
+            st.error("Select at least one brand.")
+            return
+        if not state.strip():
+            st.error("State is required.")
+            return
+        if city_required and not city.strip():
+            st.error("City is required for: " + ", ".join(city_required))
+            return
+        if pincode_required and not pincode.strip():
+            st.error("Pincode is required for: " + ", ".join(pincode_required))
+            return
+
+        progress = st.progress(0, text="Starting...")
+        for index, brand in enumerate(selected_brands, start=1):
+            progress.progress((index - 1) / len(selected_brands), text=f"Running {brand}...")
+            try:
+                handler_class = registry.get(brand)
+                if handler_class is None:
+                    raise LookupError(f"No source is installed for {brand}.")
+                records.extend(fetch_records(
+                    handler_class(),
+                    category=scraper_category,
+                    state=state.strip(),
+                    city=city.strip(),
+                    pincode=pincode.strip(),
+                ))
+            except Exception as exc:
+                errors.append(f"{brand}: {exc}")
+            progress.progress(index / len(selected_brands), text=f"Finished {brand}")
+        progress.empty()
+        raw_count = len(records)
+        records = records_without_duplicates(records)
+        filename = export_filename(category, city.strip(), pincode.strip())
+        _, saved_key, save_error = save_records_to_shared_files(
+            records,
+            filename=filename,
+            bucket_name=bucket_name,
+        )
+
+        st.session_state.pop("google_verified_result", None)
+        st.session_state["scraper_result"] = {
+            "signature": scrape_signature,
+            "records": records,
+            "errors": errors,
+            "filename": filename,
+            "raw_count": raw_count,
+            "saved_key": saved_key,
+            "save_error": save_error,
+        }
+
+    result = st.session_state.get("scraper_result")
+    if not result or result.get("signature") != scrape_signature:
         return
 
-    errors: list[str] = []
-    records = []
-    if not selected_brands:
-        st.error("Select at least one brand.")
-        return
-    if not state.strip():
-        st.error("State is required.")
-        return
-    if city_required and not city.strip():
-        st.error("City is required for: " + ", ".join(city_required))
-        return
-    if pincode_required and not pincode.strip():
-        st.error("Pincode is required for: " + ", ".join(pincode_required))
-        return
-
-    progress = st.progress(0, text="Starting scrapers...")
-    for index, brand in enumerate(selected_brands, start=1):
-        progress.progress((index - 1) / len(selected_brands), text=f"Running {brand}...")
-        try:
-            handler_class = registry.get(brand)
-            if handler_class is None:
-                raise LookupError(f"No scraper plugin is installed for {brand}.")
-            records.extend(fetch_records(
-                handler_class(),
-                category=scraper_category,
-                state=state.strip(),
-                city=city.strip(),
-                pincode=pincode.strip(),
-            ))
-        except Exception as exc:
-            errors.append(f"{brand}: {exc}")
-        progress.progress(index / len(selected_brands), text=f"Finished {brand}")
-    progress.empty()
-
+    records = result.get("records", [])
+    errors = result.get("errors", [])
     if errors:
-        st.warning("Some scrapers could not finish:\n\n" + "\n\n".join(
+        st.warning("Some sources could not finish:\n\n" + "\n\n".join(
             f"- {error}" for error in errors
         ))
     if not records:
         if not errors:
-            st.info("The scrapers completed, but no dealer records were returned.")
+            st.info("No dealer records were returned.")
         return
 
     st.success(f"Found {len(records)} dealer records across {len(selected_brands)} brand(s).")
+    if result.get("raw_count", len(records)) != len(records):
+        st.caption(
+            f"Removed {result.get('raw_count', len(records)) - len(records)} duplicate address row(s)."
+        )
+    if result.get("saved_key"):
+        st.caption(f"Saved to shared files: {Path(result['saved_key']).name}")
+    elif result.get("save_error"):
+        st.warning(f"Local Excel was generated, but shared file save failed: {result['save_error']}")
     render_records_table(records)
-    filename = export_filename(category, city.strip(), pincode.strip())
-    output_path = export_to_xlsx(records, OUTPUT_DIR, filename)
-    file_bytes = output_path.read_bytes()
-    st.download_button(
-        "Download Excel", data=file_bytes, file_name=filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
 
-    if upload_to_s3:
+    st.divider()
+    if st.button(
+        "Verify with Google Places",
+        type="primary",
+        use_container_width=True,
+        help=(
+            "Keeps only Google operational businesses with a phone number, "
+            "then sorts by Google rating and review count."
+        ),
+    ):
+        before_count = len(records)
+        verify_progress = st.progress(0, text="Starting Google Places verification...")
+
+        def update_google_progress(index: int, total: int, record) -> None:
+            name = str(getattr(record, "name", "") or "dealer")
+            verify_progress.progress(index / total, text=f"Checking {name}...")
+
         try:
-            storage = load_storage(bucket_name, active_region())
-            key = storage.upload_path(output_path)
-            st.success("Saved to shared files.")
+            verified_records = verify_records_with_google(
+                records,
+                state=state.strip(),
+                city=city.strip(),
+                pincode=pincode.strip(),
+                search_terms=google_terms_for_category(category),
+                on_progress=update_google_progress,
+            )
         except Exception as exc:
-            st.warning(f"Excel was generated locally, but shared file upload failed: {exc}")
+            verify_progress.empty()
+            st.error(f"Google Places verification failed: {exc}")
+            return
+        verify_progress.empty()
+        _, verified_saved_key, verified_save_error = save_records_to_shared_files(
+            verified_records,
+            filename=result["filename"],
+            bucket_name=bucket_name,
+        )
+        st.session_state["google_verified_result"] = {
+            "signature": scrape_signature,
+            "records": verified_records,
+            "source_count": before_count,
+            "filename": result["filename"],
+            "saved_key": verified_saved_key,
+            "save_error": verified_save_error,
+        }
+
+    verified_result = st.session_state.get("google_verified_result")
+    if not verified_result or verified_result.get("signature") != scrape_signature:
+        return
+
+    verified_records = verified_result.get("records", [])
+    st.info(
+        f"Google Places kept {len(verified_records)} of "
+        f"{verified_result.get('source_count', len(records))} records "
+        "with operational status and phone numbers."
+    )
+    if not verified_records:
+        return
+
+    render_records_table(verified_records)
+    if verified_result.get("saved_key"):
+        st.caption(f"Replaced saved file: {Path(verified_result['saved_key']).name}")
+    elif verified_result.get("save_error"):
+        st.warning(f"Verified Excel was generated, but shared file save failed: {verified_result['save_error']}")
 
 
 def render_s3_dashboard() -> None:
@@ -383,15 +678,6 @@ def render_s3_dashboard() -> None:
     if not exists:
         st.warning("Shared file storage is not available.")
         return
-
-    upload = st.file_uploader("Upload a file", type=["xlsx", "csv", "json", "txt"])
-    if upload is not None and st.button("Upload file"):
-        try:
-            key = storage.upload_fileobj(upload, upload.name)
-            st.success(f"Uploaded {Path(key).name}")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Upload failed: {exc}")
 
     try:
         files = storage.list_files()
@@ -423,10 +709,28 @@ def render_s3_dashboard() -> None:
 
     if st.session_state.get("s3_selected_key") == selected_key:
         data = st.session_state.get("s3_selected_data", b"")
+        without_duplicates = st.checkbox(
+            "Download without duplicate rows",
+            key=f"without-duplicates-{selected_key}",
+        )
+        try:
+            download_data, download_name, download_mime = saved_file_download_payload(
+                selected_key,
+                data,
+                without_duplicates,
+            )
+        except Exception as exc:
+            st.warning(f"Could not prepare download: {exc}")
+            download_data = data
+            download_name = Path(selected_key).name
+            download_mime = "application/octet-stream"
         st.download_button(
-            "Download selected file", data=data,
-            file_name=Path(selected_key).name,
-            mime="application/octet-stream",
+            "Download file",
+            data=download_data,
+            file_name=download_name,
+            mime=download_mime,
+            key=f"download-selected-{selected_key}",
+            use_container_width=True,
         )
         render_file_preview(selected_key, data)
 
@@ -446,26 +750,58 @@ def render_file_preview(key: str, data: bytes) -> None:
     suffix = Path(key).suffix.casefold()
     if suffix == ".xlsx":
         try:
-            workbook = openpyxl.load_workbook(BytesIO(data), read_only=True, data_only=True)
+            workbook = openpyxl.load_workbook(BytesIO(data), read_only=False, data_only=True)
             sheet = workbook.active
-            rows = list(sheet.iter_rows(values_only=True, max_row=201))
+            rows = list(sheet.iter_rows(max_row=201))
             if rows:
-                headers = [str(value or "") for value in rows[0]]
-                dataframe = pd.DataFrame([dict(zip(headers, row)) for row in rows[1:]])
+                headers = [str(cell.value or "") for cell in rows[0]]
+                preview_rows = []
+                for row in rows[1:]:
+                    values = [
+                        cell.hyperlink.target
+                        if cell.hyperlink and cell.hyperlink.target
+                        else cell.value
+                        for cell in row
+                    ]
+                    preview_rows.append(dict(zip(headers, values)))
+                dataframe = pd.DataFrame(preview_rows)
                 render_duplicate_dataframe(dataframe, preview_limit=200)
         except Exception as exc:
             st.warning(f"Excel preview unavailable: {exc}")
-    elif suffix in {".csv", ".json", ".txt"}:
+    elif suffix == ".csv":
+        try:
+            dataframe = pd.read_csv(BytesIO(data))
+            render_duplicate_dataframe(dataframe, preview_limit=200)
+        except Exception as exc:
+            st.warning(f"CSV preview unavailable: {exc}")
+    elif suffix in {".json", ".txt"}:
         st.text_area("Preview", data[:100_000].decode("utf-8", errors="replace"), height=300)
     else:
         st.caption("Preview is unavailable for this file type; use Download instead.")
 
 
-st.set_page_config(page_title="Dealer Scraper", page_icon="🔎", layout="wide")
-st.title("Dealer Scraper")
-st.caption("Run brand scrapers and manage generated Excel files.")
+st.set_page_config(page_title="Dealer Finder", page_icon="🔎", layout="wide")
+st.markdown(
+    """
+    <style>
+    .stButton button[kind="primary"] {
+        background-color: #16803c;
+        border-color: #16803c;
+        color: #ffffff;
+    }
+    .stButton button[kind="primary"]:hover {
+        background-color: #0f6b31;
+        border-color: #0f6b31;
+        color: #ffffff;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+st.title("Dealer Finder")
+st.caption("Run brand sources and manage generated Excel files.")
 
-scraper_tab, files_tab = st.tabs(["Run scrapers", "Saved files"])
+scraper_tab, files_tab = st.tabs(["Run", "Saved files"])
 with scraper_tab:
     render_scraper_dashboard(load_registry())
 with files_tab:

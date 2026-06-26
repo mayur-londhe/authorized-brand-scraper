@@ -13,10 +13,8 @@ from openpyxl.utils import get_column_letter
 from .schema import DealerRecord
 
 COLUMNS = [
-    ("Duplicate Status", "duplicate_status"),
     ("Source Brand",    "source_brand"),
     ("Category",        "category"),
-    ("State Query",     "state_name"),
     ("Dealer Name",     "name"),
     ("Phone",           "phone"),
     ("Email",           "email"),
@@ -27,8 +25,18 @@ COLUMNS = [
     ("Dealer Type",     "dealer_type"),
     ("Website",         "website"),
     ("Google Maps",     "map_url"),
-    ("Latitude",        "latitude"),
-    ("Longitude",       "longitude"),
+]
+
+GOOGLE_COLUMNS = [
+    ("Google Name",     "google_name"),
+    ("Google Full Address", "google_full_address"),
+    ("Google Contact Number", "google_contact_number"),
+    ("Google Rating",   "google_rating"),
+    ("Google Reviews",  "google_reviews"),
+    ("Google Business Type", "google_business_type"),
+    ("Google Business Status", "google_business_status"),
+    ("Google Location", "google_location"),
+    ("Google Score",    "google_score"),
 ]
 
 HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
@@ -47,11 +55,10 @@ def _normalize_duplicate_value(value: str) -> str:
 
 
 def _duplicate_key(record: DealerRecord) -> tuple[str, str] | None:
-    name = _normalize_duplicate_value(record.name)
     address = _normalize_duplicate_value(record.address)
-    if not name or not address:
+    if not address:
         return None
-    return name, address
+    return ("address", address)
 
 
 def _duplicate_statuses(records: List[DealerRecord]) -> list[str]:
@@ -130,6 +137,26 @@ def records_with_duplicate_status(records: List[DealerRecord]) -> list[dict]:
     return rows
 
 
+def records_without_duplicates(records: List[DealerRecord]) -> list[DealerRecord]:
+    seen: set[tuple[str, str]] = set()
+    unique_records = []
+    for record in records:
+        key = _duplicate_key(record)
+        if key is None:
+            unique_records.append(record)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_records.append(record)
+    return unique_records
+
+
+def export_columns(records: List[DealerRecord]) -> list[tuple[str, str]]:
+    has_google_data = any(record.google_verified is not None for record in records)
+    return COLUMNS + GOOGLE_COLUMNS if has_google_data else COLUMNS
+
+
 def export_to_xlsx(records: List[DealerRecord], output_dir: Path, filename: str = "") -> Path:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -141,9 +168,10 @@ def export_to_xlsx(records: List[DealerRecord], output_dir: Path, filename: str 
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Dealer Logbook"
+    columns = export_columns(records)
 
     # ── Header row ────────────────────────────────────────────────────
-    for col_idx, (header, _) in enumerate(COLUMNS, start=1):
+    for col_idx, (header, _) in enumerate(columns, start=1):
         cell = ws.cell(row=1, column=col_idx, value=header)
         cell.font   = HEADER_FONT
         cell.fill   = HEADER_FILL
@@ -158,12 +186,16 @@ def export_to_xlsx(records: List[DealerRecord], output_dir: Path, filename: str 
         is_duplicate = duplicate_status.startswith("Duplicate")
         fill = DUPLICATE_FILL if is_duplicate else ALT_FILL if row_idx % 2 == 0 else None
 
-        for col_idx, (_, field_key) in enumerate(COLUMNS, start=1):
+        for col_idx, (_, field_key) in enumerate(columns, start=1):
             val = rec_dict.get(field_key, "")
             cell = ws.cell(row=row_idx, column=col_idx, value=val or "")
             cell.border = BORDER
             cell.alignment = Alignment(vertical="center", wrap_text=True)
             if field_key == "map_url" and val:
+                cell.hyperlink = val
+                cell.value = "Open Map"
+                cell.font = Font(color="0563C1", underline="single")
+            if field_key == "google_location" and val:
                 cell.hyperlink = val
                 cell.value = "Open Map"
                 cell.font = Font(color="0563C1", underline="single")
@@ -173,7 +205,10 @@ def export_to_xlsx(records: List[DealerRecord], output_dir: Path, filename: str 
                 cell.font = DUPLICATE_FONT
 
     # ── Column widths ─────────────────────────────────────────────────
-    col_widths = [28, 16, 22, 18, 28, 18, 28, 38, 18, 18, 12, 20, 28, 18, 12, 12]
+    col_widths = [
+        16, 22, 28, 18, 28, 38, 18, 18, 12, 20, 28, 18,
+        28, 42, 22, 14, 15, 30, 22, 28, 14,
+    ]
     for i, w in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 

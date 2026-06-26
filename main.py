@@ -14,11 +14,13 @@ import inspect
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 # Ensure project root is on the path
 ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT))
 
-from core import PluginRegistry, export_to_xlsx
+from core import PluginRegistry, export_to_xlsx, verify_records_with_google
 from catalog import (
     CATEGORY_BRANDS,
     brands_for_category as get_category_brands,
@@ -46,6 +48,16 @@ def export_filename(category: str, city: str = "", pincode: str = "") -> str:
         datetime.now().strftime("%Y%m%d_%H%M%S"),
     ]
     return "_".join(part for part in parts if part and part != "dealers") + ".xlsx"
+
+
+def google_terms_for_category(category: str) -> str:
+    category_key = str(category or "").casefold()
+    if "fan" in category_key:
+        return "fans"
+    if "cool" in category_key or "roof" in category_key or "paint" in category_key:
+        return "paint"
+    return "bathroom fitting sanitaryware"
+
 
 def build_registry() -> PluginRegistry:
     registry = PluginRegistry()
@@ -93,6 +105,8 @@ def run_all_brands(registry, category: str, state: str, city: str = "", pincode:
 
 
 def main():
+    load_dotenv(ROOT / ".env")
+
     parser = argparse.ArgumentParser(
         description="Multi-brand dealer scraper orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -110,6 +124,16 @@ Examples:
     parser.add_argument("--city",     default="",         help="City name (required for Parryware)")
     parser.add_argument("--pincode",  default="",         help="Pincode (required for Dr Fixit)")
     parser.add_argument("--output",   default="",         help="Custom output filename (.xlsx)")
+    parser.add_argument(
+        "--verify-google",
+        action="store_true",
+        help="Verify scraped records with Google Places before export",
+    )
+    parser.add_argument(
+        "--google-search-terms",
+        default="",
+        help="Extra terms appended to Google Places verification queries",
+    )
     parser.add_argument("--list-brands", action="store_true", help="List registered brands and exit")
     args = parser.parse_args()
 
@@ -155,6 +179,26 @@ Examples:
     if not records:
         print("[Orchestrator] No records returned. Nothing to export.")
         return
+
+    if args.verify_google:
+        before_count = len(records)
+        print(
+            "[Orchestrator] Verifying with Google Places "
+            "(keeping operational businesses with phone numbers)..."
+        )
+        records = verify_records_with_google(
+            records,
+            state=args.state,
+            city=args.city,
+            pincode=args.pincode,
+            search_terms=args.google_search_terms or google_terms_for_category(args.category),
+        )
+        print(
+            f"[Orchestrator] Google verified {len(records)} of {before_count} records."
+        )
+        if not records:
+            print("[Orchestrator] No Google-verified records to export.")
+            return
 
     # ── Export ────────────────────────────────────────────────────────
     filename = args.output or export_filename(args.category, args.city, args.pincode)

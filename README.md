@@ -1,9 +1,10 @@
-# Dealer Scraper
+# Dealer Finder
 
 A simple tool for collecting dealer/store data from brand store locators.
 
 The app lets the user choose a category, select one or more brands, enter the
-required location details, and download a formatted Excel file.
+required location details, verify results with Google Places, and manage saved
+Excel files.
 
 ## Start The App
 
@@ -31,14 +32,23 @@ Only these categories are shown in the app:
 Some brands need only state and city. Some brands also need pincode. The app
 enables the pincode field only when the selected brand needs it.
 
-## Running Scrapers
+## Running
 
 1. Select a category.
-2. Select the brands to scrape.
+2. Select the brands to run.
 3. Enter the requested state, city, and pincode.
-4. Click `Run scrapers`.
+4. Click `Run`.
 5. Review the table.
-6. Click `Download Excel`.
+
+Address duplicates are removed automatically before the file is saved. If
+shared file storage is configured, the generated Excel file is saved
+automatically.
+
+After the table is visible, enable `Verify this sheet with Google Places` to
+keep only exact Google Places name matches that are operational and have a
+phone number. Verified rows are sorted by a combined Google rating/review
+score. Rating and review count are used only for sorting, not for filtering. If
+verification is run, the verified Excel file replaces the previously saved file.
 
 The generated file name uses this format:
 
@@ -56,7 +66,6 @@ bengaluru_560038_fans_20260624_122805.xlsx
 
 The Excel file and app table include:
 
-- Duplicate Status
 - Source Brand
 - Category
 - Dealer Name
@@ -69,35 +78,34 @@ The Excel file and app table include:
 - Dealer Type
 - Website
 - Google Maps
-- Latitude
-- Longitude
+- Google verification fields, when Google Places verification is enabled
+- Google Directions, when Google Places verification is enabled
 
 `Website` is only for an actual dealer/company website when one is available.
 Google Maps, directions, and locator links are kept out of the Website column.
 
-`Google Maps` contains the directions/maps link when the scraper finds one. If
+`Google Maps` contains the directions/maps link when the source finds one. If
 there is no directions link but latitude and longitude are available, the app
 creates a Google Maps link from those coordinates.
 
 ## Duplicate Marking
 
-Rows are marked as duplicates when both dealer name and address match another
-row.
+Rows are treated as duplicates when the address matches another row.
 
-Duplicates are not removed. They stay visible in the app and Excel file, and
-duplicate rows are highlighted in red.
+Duplicate address rows are removed from newly generated files. In Saved files,
+the download checkbox can also remove duplicate address rows from older files.
 
 ## Saved Files
 
 If shared file storage is configured for this installation, generated Excel
-files are also saved automatically in the `Saved files` tab.
+files are saved automatically. Google-verified files replace the initial saved
+file for the same run.
 
 From that tab users can:
 
 - See previously generated files
 - Preview an Excel file
-- Download a selected file
-- Upload a file
+- Download a selected file with or without duplicate address rows
 - Delete a selected file after confirming
 
 Users do not need to enter storage settings in the app.
@@ -109,7 +117,7 @@ Important code files and folders:
 - `streamlit_app.py` - user interface
 - `main.py` - command-line runner
 - `catalog.py` - category and brand list
-- `brands/` - brand-specific scraper plugins
+- `brands/` - brand-specific source plugins
 - `core/` - shared exporter, schema, registry, and storage code
 - `requirements.txt` - Python packages
 

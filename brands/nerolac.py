@@ -199,12 +199,7 @@ class NerolacHandler(BaseBrandHandler):
         email = self._first_match(self.EMAIL_RE, full_text)
         pincode = self._first_match(self.PINCODE_RE, full_text) or input_pincode
 
-        ignored = {name.casefold(), phone.casefold(), email.casefold()}
-        address = ", ".join(
-            line
-            for line in lines[1:]
-            if line.casefold() not in ignored and not self.PHONE_RE.fullmatch(line)
-        )
+        address = ", ".join(self._address_lines(lines[1:], name, phone, email))
 
         map_link_node = card.select_one("a[href*='maps']")
         block = card if card.has_attr("data-lang") else card.select_one("[data-lang]")
@@ -405,6 +400,37 @@ class NerolacHandler(BaseBrandHandler):
     def _first_match(pattern, text: str) -> str:
         match = pattern.search(text)
         return match.group(0) if match else ""
+
+    @classmethod
+    def _address_lines(cls, lines, name: str, phone: str, email: str) -> list[str]:
+        ignored_exact = {
+            name.casefold(),
+            phone.casefold(),
+            email.casefold(),
+            "address",
+            "get direction",
+            "get directions",
+            "directions",
+            "direction",
+            "view details",
+            "call",
+            "phone",
+            "contact",
+        }
+        cleaned = []
+        for line in lines:
+            value = re.sub(r"\s+", " ", str(line or "")).strip(" ,:-")
+            lower = value.casefold()
+            if not value or lower in ignored_exact:
+                continue
+            if cls.PHONE_RE.search(value) or cls.EMAIL_RE.search(value):
+                continue
+            if re.search(r"\b\d+(?:\.\d+)?\s*km\b", value, re.IGNORECASE):
+                continue
+            if any(token in lower for token in ("get direction", "view detail", "call now", "open now", "closed now")):
+                continue
+            cleaned.append(value)
+        return cleaned
 
     @staticmethod
     def _save_diagnostics_driver(driver) -> None:
