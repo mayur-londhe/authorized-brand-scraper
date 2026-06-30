@@ -24,7 +24,7 @@ class CromptonHandler(BaseBrandHandler):
         locator_city = self.CITY_ALIASES.get(city.casefold(), city)
 
         failures = []
-        for headless in (True, False):
+        for headless in (True,):
             try:
                 return self._scrape_browser(
                     category, state, locator_city, headless=headless
@@ -51,8 +51,7 @@ class CromptonHandler(BaseBrandHandler):
         from selenium.webdriver.support.ui import WebDriverWait
 
         options = webdriver.ChromeOptions()
-        if headless:
-            options.add_argument("--headless=new")
+        options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--no-sandbox")

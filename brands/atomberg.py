@@ -49,10 +49,8 @@ class AtombergHandler(BaseBrandHandler):
             raise ValueError("Pincode is required for Atomberg.")
 
         failures = []
-        # Atomberg is prone to contact-detail modals and map overlays, so run
-        # the visible browser first instead of spending a hidden headless
-        # attempt that commonly times out before the user sees anything.
-        for headless in (False,):
+        # Keep browser automation hidden; modal handling is performed in-page.
+        for headless in (True,):
             mode = "headless" if headless else "visible"
             try:
                 records = self._scrape_browser(
@@ -88,8 +86,7 @@ class AtombergHandler(BaseBrandHandler):
         from selenium.webdriver.support.ui import WebDriverWait
 
         options = webdriver.ChromeOptions()
-        if headless:
-            options.add_argument("--headless=new")
+        options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--no-sandbox")

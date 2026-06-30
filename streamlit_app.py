@@ -1,6 +1,7 @@
 """Web interface for scraping dealers and managing generated S3 files."""
 
 from datetime import datetime
+import importlib
 from io import BytesIO
 import inspect
 import os
@@ -21,9 +22,10 @@ from core import (
     pincode_from_address,
     records_with_duplicate_status,
     records_without_duplicates,
-    verify_records_with_google,
 )
 from core.s3_storage import S3Storage
+import core.google_places as google_places_module
+import core.schema as schema_module
 
 ROOT = Path(__file__).parent.resolve()
 OUTPUT_DIR = ROOT / "output"
@@ -40,6 +42,28 @@ def load_registry() -> PluginRegistry:
 @st.cache_resource
 def load_storage(bucket_name: str, region: str) -> S3Storage:
     return S3Storage(bucket_name=bucket_name, region=region)
+
+
+def verify_records_with_google_including_unverified(records, **kwargs):
+    """Verify using a coherent, current schema even after a Streamlit hot reload."""
+    kwargs["include_unverified"] = True
+    current_schema = importlib.reload(schema_module)
+    current_google_places = importlib.reload(google_places_module)
+    field_names = current_schema.DealerRecord.__dataclass_fields__
+    current_records = [
+        current_schema.DealerRecord(
+            **{
+                name: getattr(record, name)
+                for name in field_names
+                if hasattr(record, name)
+            }
+        )
+        for record in records
+    ]
+    return current_google_places.verify_records_with_google(
+        current_records,
+        **kwargs,
+    )
 
 
 def available_brands(registry: PluginRegistry, category: str) -> list[str]:
@@ -90,6 +114,32 @@ def fetch_records(handler, category: str, state: str, city: str, pincode: str = 
     return handler.fetch(**kwargs)
 
 
+def record_pincode(record) -> str:
+    explicit = str(getattr(record, "pincode", "") or "").strip()
+    return explicit or pincode_from_address(getattr(record, "address", ""))
+
+
+def records_for_pincode(records, pincode: str, *, keep_other_pincodes: bool):
+    requested = str(pincode or "").strip()
+    if not requested:
+        return list(records)
+    sorted_records = sorted(
+        records,
+        key=lambda record: (
+            0 if record_pincode(record) == requested or requested in str(getattr(record, "address", "")) else 1,
+            str(getattr(record, "source_brand", "")),
+            str(getattr(record, "name", "")),
+        ),
+    )
+    if keep_other_pincodes:
+        return sorted_records
+    return [
+        record for record in sorted_records
+        if record_pincode(record) == requested
+        or requested in str(getattr(record, "address", ""))
+    ]
+
+
 BASE_DISPLAY_COLUMNS = {
     "source_brand": "Source Brand",
     "category": "Category",
@@ -114,6 +164,8 @@ GOOGLE_DISPLAY_COLUMNS = {
     "google_business_type": "Google Business Type",
     "google_business_status": "Google Business Status",
     "google_location": "Google Location",
+    "google_verification_status": "Google Verification Status",
+    "google_verification_reason": "Google Verification Reason",
     "google_score": "Google Score",
 }
 
@@ -312,6 +364,14 @@ def dataframe_without_duplicate_rows(dataframe: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def dataframe_without_unverified_rows(dataframe: pd.DataFrame) -> pd.DataFrame:
+    status_column = find_column(dataframe, {"google verification status"})
+    if not status_column:
+        return dataframe
+    statuses = dataframe[status_column].astype(str).str.strip().str.casefold()
+    return dataframe.loc[statuses.ne("unverified")]
+
+
 def dataframe_with_download_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
     enriched = enrich_location_columns(dataframe)
     enriched = ensure_google_link_columns(enriched)
@@ -372,7 +432,13 @@ def dataframe_to_xlsx_bytes(dataframe: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def saved_file_download_payload(key: str, data: bytes, without_duplicates: bool) -> tuple[bytes, str, str]:
+def saved_file_download_payload(
+    key: str,
+    data: bytes,
+    *,
+    without_duplicates: bool,
+    include_unverified: bool,
+) -> tuple[bytes, str, str]:
     suffix = Path(key).suffix.casefold()
     name = Path(key).name
     stem = Path(key).stem
@@ -383,12 +449,17 @@ def saved_file_download_payload(key: str, data: bytes, without_duplicates: bool)
             return data, name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         headers = [str(value or "") for value in rows[0]]
         dataframe = pd.DataFrame([dict(zip(headers, row)) for row in rows[1:]])
-        clean_dataframe = (
-            dataframe_without_duplicate_rows(dataframe)
-            if without_duplicates
-            else dataframe_with_download_columns(dataframe)
-        )
-        download_name = f"{stem}_without_duplicates.xlsx" if without_duplicates else name
+        clean_dataframe = dataframe_with_download_columns(dataframe)
+        if without_duplicates:
+            clean_dataframe = dataframe_without_duplicate_rows(clean_dataframe)
+        if not include_unverified:
+            clean_dataframe = dataframe_without_unverified_rows(clean_dataframe)
+        suffix_parts = []
+        if without_duplicates:
+            suffix_parts.append("without_duplicates")
+        if not include_unverified:
+            suffix_parts.append("verified_only")
+        download_name = f"{stem}_{'_'.join(suffix_parts)}.xlsx" if suffix_parts else name
         return (
             dataframe_to_xlsx_bytes(clean_dataframe),
             download_name,
@@ -396,12 +467,17 @@ def saved_file_download_payload(key: str, data: bytes, without_duplicates: bool)
         )
     if suffix == ".csv":
         dataframe = pd.read_csv(BytesIO(data))
-        clean_dataframe = (
-            dataframe_without_duplicate_rows(dataframe)
-            if without_duplicates
-            else dataframe_with_download_columns(dataframe)
-        )
-        download_name = f"{stem}_without_duplicates.csv" if without_duplicates else name
+        clean_dataframe = dataframe_with_download_columns(dataframe)
+        if without_duplicates:
+            clean_dataframe = dataframe_without_duplicate_rows(clean_dataframe)
+        if not include_unverified:
+            clean_dataframe = dataframe_without_unverified_rows(clean_dataframe)
+        suffix_parts = []
+        if without_duplicates:
+            suffix_parts.append("without_duplicates")
+        if not include_unverified:
+            suffix_parts.append("verified_only")
+        download_name = f"{stem}_{'_'.join(suffix_parts)}.csv" if suffix_parts else name
         return (
             clean_dataframe.to_csv(index=False).encode("utf-8"),
             download_name,
@@ -485,14 +561,9 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
     left, middle, right = st.columns(3)
     state = left.text_input("State", placeholder="Karnataka")
     city = middle.text_input("City", placeholder="Bengaluru")
-    pincode_required = [
-        brand for brand in selected_brands
-        if registry.get(brand) and getattr(registry.get(brand), "REQUIRES_PINCODE", False)
-    ]
     pincode = right.text_input(
-        "Pincode",
+        "Pincode *",
         placeholder="560001",
-        disabled=not pincode_required,
     )
     city_required = [
         brand for brand in selected_brands
@@ -500,8 +571,6 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
     ]
     if city_required:
         st.caption("City is required for: " + ", ".join(city_required))
-    if pincode_required:
-        st.caption("Pincode is required for: " + ", ".join(pincode_required))
 
     bucket_name = active_bucket_name()
     upload_to_s3 = bool(bucket_name)
@@ -527,8 +596,8 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
         if city_required and not city.strip():
             st.error("City is required for: " + ", ".join(city_required))
             return
-        if pincode_required and not pincode.strip():
-            st.error("Pincode is required for: " + ", ".join(pincode_required))
+        if not re.fullmatch(r"[1-9]\d{5}", pincode.strip()):
+            st.error("Enter a valid 6-digit pincode.")
             return
 
         progress = st.progress(0, text="Starting...")
@@ -551,6 +620,11 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
         progress.empty()
         raw_count = len(records)
         records = records_without_duplicates(records)
+        records = records_for_pincode(
+            records,
+            pincode.strip(),
+            keep_other_pincodes=True,
+        )
         filename = export_filename(category, city.strip(), pincode.strip())
         _, saved_key, save_error = save_records_to_shared_files(
             records,
@@ -573,21 +647,40 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
     if not result or result.get("signature") != scrape_signature:
         return
 
-    records = result.get("records", [])
+    all_records = result.get("records", [])
     errors = result.get("errors", [])
     if errors:
         st.warning("Some sources could not finish:\n\n" + "\n\n".join(
             f"- {error}" for error in errors
         ))
-    if not records:
+    if not all_records:
         if not errors:
             st.info("No dealer records were returned.")
         return
 
+    keep_other_pincodes = st.checkbox(
+        "Keep dealers from other pincodes",
+        value=False,
+        key="keep-other-pincodes-after-scrape",
+        help=(
+            "When enabled, dealers outside the requested pincode are retained "
+            "after the requested pincode results."
+        ),
+    )
+    records = records_for_pincode(
+        all_records,
+        pincode.strip(),
+        keep_other_pincodes=keep_other_pincodes,
+    )
+
+    if not records:
+        st.info(f"No dealer records matched pincode {pincode.strip()}.")
+        return
+
     st.success(f"Found {len(records)} dealer records across {len(selected_brands)} brand(s).")
-    if result.get("raw_count", len(records)) != len(records):
+    if result.get("raw_count", len(all_records)) != len(all_records):
         st.caption(
-            f"Removed {result.get('raw_count', len(records)) - len(records)} duplicate address row(s)."
+            f"Removed {result.get('raw_count', len(all_records)) - len(all_records)} duplicate address row(s)."
         )
     if result.get("saved_key"):
         st.caption(f"Saved to shared files: {Path(result['saved_key']).name}")
@@ -601,7 +694,7 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
         type="primary",
         use_container_width=True,
         help=(
-            "Keeps only Google operational businesses with a phone number, "
+            "Keeps Google operational businesses whether or not a phone number is available, "
             "then sorts by Google rating and review count."
         ),
     ):
@@ -613,7 +706,7 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
             verify_progress.progress(index / total, text=f"Checking {name}...")
 
         try:
-            verified_records = verify_records_with_google(
+            verified_records = verify_records_with_google_including_unverified(
                 records,
                 state=state.strip(),
                 city=city.strip(),
@@ -645,10 +738,15 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
         return
 
     verified_records = verified_result.get("records", [])
+    verified_count = sum(
+        1 for record in verified_records
+        if str(getattr(record, "google_verification_status", "") or "").casefold() == "verified"
+    )
+    unverified_count = len(verified_records) - verified_count
     st.info(
-        f"Google Places kept {len(verified_records)} of "
-        f"{verified_result.get('source_count', len(records))} records "
-        "with operational status and phone numbers."
+        f"Google Places verified {verified_count} of "
+        f"{verified_result.get('source_count', len(records))} records. "
+        f"Unverified rows shown: {unverified_count}."
     )
     if not verified_records:
         return
@@ -713,11 +811,17 @@ def render_s3_dashboard() -> None:
             "Download without duplicate rows",
             key=f"without-duplicates-{selected_key}",
         )
+        include_unverified = st.checkbox(
+            "Include unverified Google rows",
+            value=True,
+            key=f"include-unverified-{selected_key}",
+        )
         try:
             download_data, download_name, download_mime = saved_file_download_payload(
                 selected_key,
                 data,
-                without_duplicates,
+                without_duplicates=without_duplicates,
+                include_unverified=include_unverified,
             )
         except Exception as exc:
             st.warning(f"Could not prepare download: {exc}")

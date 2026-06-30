@@ -37,7 +37,7 @@ class OrientHandler(BaseBrandHandler):
             print(f"[Orient] Locator data fallback failed: {type(exc).__name__}: {exc}")
 
         failures = []
-        for headless in (True, False):
+        for headless in (True,):
             try:
                 return self._scrape_browser(
                     category, state, locator_city, headless=headless
@@ -124,8 +124,7 @@ class OrientHandler(BaseBrandHandler):
         from selenium.webdriver.support.ui import WebDriverWait
 
         options = webdriver.ChromeOptions()
-        if headless:
-            options.add_argument("--headless=new")
+        options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--no-sandbox")

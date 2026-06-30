@@ -42,6 +42,8 @@ class DealerRecord:
     google_business_status: Optional[str] = None
     google_place_id: Optional[str] = None
     google_location: Optional[str] = None
+    google_verification_status: Optional[str] = None
+    google_verification_reason: Optional[str] = None
     google_score: Optional[float] = None
 
     def to_dict(self) -> dict:

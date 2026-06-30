@@ -110,7 +110,7 @@ def fetch_google_data(
     state: str = "",
     search_terms: str = DEFAULT_SEARCH_TERMS,
     timeout: int = DEFAULT_TIMEOUT,
-) -> dict | None:
+) -> tuple[dict | None, str]:
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
@@ -141,12 +141,12 @@ def fetch_google_data(
     data = response.json()
     places = data.get("places") or []
     if not places:
-        return None
+        return None, "No Google Places result"
 
     place = places[0]
     place_name = get_place_display_name(place)
     if not place_name or not is_company_match(record.name, place_name):
-        return None
+        return None, f"Name mismatch: {record.name} vs {place_name or 'N/A'}"
 
     rating = place.get("rating")
     reviews = place.get("userRatingCount")
@@ -158,11 +158,11 @@ def fetch_google_data(
     )
     if place_id:
         google_location += f"&query_place_id={quote_plus(str(place_id))}"
-    return {
+    google_data = {
         "google_name": place_name or place.get("name", ""),
         "google_full_address": place.get("formattedAddress", ""),
         "google_contact_number": place.get("nationalPhoneNumber", ""),
-        "google_rating": round(_safe_float(rating)) if rating is not None else None,
+        "google_rating": round(_safe_float(rating), 1) if rating is not None else None,
         "google_reviews": reviews,
         "google_business_type": ", ".join(place.get("types", [])).replace("_", " "),
         "google_business_status": place.get("businessStatus", ""),
@@ -170,25 +170,43 @@ def fetch_google_data(
         "google_location": google_location,
         "google_score": google_sort_score(rating, reviews),
     }
+    if str(google_data["google_business_status"] or "").casefold() != "operational":
+        return google_data, "Google business is not operational"
+    return google_data, ""
 
 
-def record_with_google_data(record: DealerRecord, google_data: dict | None) -> DealerRecord:
+def record_with_google_data(
+    record: DealerRecord,
+    google_data: dict | None,
+    *,
+    verified: bool | None = None,
+    reason: str = "",
+) -> DealerRecord:
     if not google_data:
-        return replace(record, google_verified=False)
+        return replace(
+            record,
+            google_verified=False if verified is None else verified,
+            google_verification_status="Unverified",
+            google_verification_reason=reason,
+        )
     allowed_fields = {field.name for field in fields(record)}
     filtered_data = {
         key: value
         for key, value in google_data.items()
         if key in allowed_fields
     }
-    return replace(record, google_verified=True, **filtered_data)
-
-
-def is_operational_with_phone(record: DealerRecord) -> bool:
-    return (
-        str(record.google_business_status or "").casefold() == "operational"
-        and bool(str(record.google_contact_number or "").strip())
+    is_verified = is_operational_with_google_data(filtered_data) if verified is None else verified
+    return replace(
+        record,
+        google_verified=is_verified,
+        google_verification_status="Verified" if is_verified else "Unverified",
+        google_verification_reason="" if is_verified else reason,
+        **filtered_data,
     )
+
+
+def is_operational_with_google_data(google_data: dict) -> bool:
+    return str(google_data.get("google_business_status") or "").casefold() == "operational"
 
 
 def sort_google_verified(records: Iterable[DealerRecord]) -> list[DealerRecord]:
@@ -213,8 +231,9 @@ def verify_records_with_google(
     search_terms: str = DEFAULT_SEARCH_TERMS,
     timeout: int = DEFAULT_TIMEOUT,
     on_progress: Callable[[int, int, DealerRecord], None] | None = None,
+    include_unverified: bool = False,
 ) -> list[DealerRecord]:
-    """Verify records, filter non-operational/no-phone Google matches, and sort."""
+    """Verify records, filter non-operational Google matches, and sort."""
     resolved_api_key = (
         api_key
         or os.getenv("PLACES_API_KEY")
@@ -229,11 +248,12 @@ def verify_records_with_google(
 
     record_list = list(records)
     verified = []
+    unverified = []
     for index, record in enumerate(record_list, start=1):
         if on_progress:
             on_progress(index, len(record_list), record)
         try:
-            google_data = fetch_google_data(
+            google_data, reason = fetch_google_data(
                 record,
                 api_key=resolved_api_key,
                 city=city,
@@ -245,8 +265,18 @@ def verify_records_with_google(
         except Exception as exc:
             print(f"[Google Places] {record.name}: {exc}")
             google_data = None
-        enriched = record_with_google_data(record, google_data)
-        if is_operational_with_phone(enriched):
+            reason = f"Google API error: {exc}"
+        is_verified = bool(google_data and is_operational_with_google_data(google_data))
+        enriched = record_with_google_data(
+            record,
+            google_data,
+            verified=is_verified,
+            reason=reason or "Did not pass Google verification",
+        )
+        if is_verified:
             verified.append(enriched)
+        elif include_unverified:
+            unverified.append(enriched)
 
-    return sort_google_verified(verified)
+    sorted_verified = sort_google_verified(verified)
+    return sorted_verified + unverified if include_unverified else sorted_verified

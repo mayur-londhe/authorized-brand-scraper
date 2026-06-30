@@ -36,10 +36,8 @@ class KuhlHandler(BaseBrandHandler):
             raise ValueError("Pincode is required for Kuhl.")
 
         failures = []
-        # Kuhl currently returns a 500 page in automated/headless first-loads
-        # even though the same URL opens in a normal browser. Start visible and
-        # keep retries inside the page loader.
-        for headless in (False,):
+        # Keep browser automation hidden and retries inside the page loader.
+        for headless in (True,):
             mode = "headless" if headless else "visible"
             try:
                 records = self._scrape_browser(
@@ -74,8 +72,7 @@ class KuhlHandler(BaseBrandHandler):
         from selenium.webdriver.support.ui import WebDriverWait
 
         options = webdriver.ChromeOptions()
-        if headless:
-            options.add_argument("--headless=new")
+        options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--no-sandbox")

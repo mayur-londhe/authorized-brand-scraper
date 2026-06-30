@@ -23,7 +23,7 @@ class AsianPaintsHandler(BaseBrandHandler):
             raise ValueError("City is required for Asian Paints.")
 
         failures = []
-        for headless in (True, False):
+        for headless in (True,):
             try:
                 return self._scrape_browser(category, state, city, headless=headless)
             except Exception as exc:
@@ -92,8 +92,7 @@ class AsianPaintsHandler(BaseBrandHandler):
         from selenium import webdriver
 
         options = webdriver.ChromeOptions()
-        if headless:
-            options.add_argument("--headless=new")
+        options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--no-sandbox")

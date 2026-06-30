@@ -36,6 +36,8 @@ GOOGLE_COLUMNS = [
     ("Google Business Type", "google_business_type"),
     ("Google Business Status", "google_business_status"),
     ("Google Location", "google_location"),
+    ("Google Verification Status", "google_verification_status"),
+    ("Google Verification Reason", "google_verification_reason"),
     ("Google Score",    "google_score"),
 ]
 
@@ -207,7 +209,7 @@ def export_to_xlsx(records: List[DealerRecord], output_dir: Path, filename: str 
     # ── Column widths ─────────────────────────────────────────────────
     col_widths = [
         16, 22, 28, 18, 28, 38, 18, 18, 12, 20, 28, 18,
-        28, 42, 22, 14, 15, 30, 22, 28, 14,
+        28, 42, 22, 14, 15, 30, 22, 28, 24, 36, 14,
     ]
     for i, w in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w

@@ -42,13 +42,14 @@ enables the pincode field only when the selected brand needs it.
 
 Address duplicates are removed automatically before the file is saved. If
 shared file storage is configured, the generated Excel file is saved
-automatically.
+automatically. When a pincode is entered, matching pincode rows are shown first.
 
-After the table is visible, enable `Verify this sheet with Google Places` to
-keep only exact Google Places name matches that are operational and have a
-phone number. Verified rows are sorted by a combined Google rating/review
-score. Rating and review count are used only for sorting, not for filtering. If
-verification is run, the verified Excel file replaces the previously saved file.
+After the table is visible, click `Verify with Google Places` to compare rows
+with Google Places. Verified rows are shown first, and unverified rows remain
+visible with a Google verification status/reason so they can be reviewed.
+Verified rows are sorted by a combined Google rating/review score. Rating and
+review count are used only for sorting, not for filtering. If verification is
+run, the Google-checked Excel file replaces the previously saved file.
 
 The generated file name uses this format:
 
@@ -106,6 +107,7 @@ From that tab users can:
 - See previously generated files
 - Preview an Excel file
 - Download a selected file with or without duplicate address rows
+- Include or exclude unverified Google rows during download
 - Delete a selected file after confirming
 
 Users do not need to enter storage settings in the app.

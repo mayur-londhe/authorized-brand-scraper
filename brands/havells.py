@@ -83,7 +83,7 @@ class HavellsHandler(BaseBrandHandler):
         self, category: str, state: str, locator_city: str, store_type: str
     ) -> List[DealerRecord]:
         failures = []
-        for headless in (True, False):
+        for headless in (True,):
             try:
                 return self._scrape_browser(
                     category, state, locator_city, store_type, headless=headless
@@ -110,8 +110,7 @@ class HavellsHandler(BaseBrandHandler):
         from selenium.webdriver.support.ui import WebDriverWait
 
         options = webdriver.ChromeOptions()
-        if headless:
-            options.add_argument("--headless=new")
+        options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--no-sandbox")

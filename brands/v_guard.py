@@ -26,7 +26,7 @@ class VGuardHandler(BaseBrandHandler):
             raise ValueError("State and district/city are required for V-Guard.")
 
         failures = []
-        for headless in (True, False):
+        for headless in (True,):
             mode = "headless" if headless else "visible"
             try:
                 records = self._scrape_browser(
@@ -61,8 +61,7 @@ class VGuardHandler(BaseBrandHandler):
         from selenium.webdriver.support.ui import WebDriverWait
 
         options = webdriver.ChromeOptions()
-        if headless:
-            options.add_argument("--headless=new")
+        options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--no-sandbox")

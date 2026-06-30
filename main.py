@@ -59,6 +59,27 @@ def google_terms_for_category(category: str) -> str:
     return "bathroom fitting sanitaryware"
 
 
+def record_pincode(record) -> str:
+    from core import pincode_from_address
+
+    explicit = str(getattr(record, "pincode", "") or "").strip()
+    return explicit or pincode_from_address(getattr(record, "address", ""))
+
+
+def sort_records_for_pincode(records, pincode: str):
+    requested = str(pincode or "").strip()
+    if not requested:
+        return list(records)
+    return sorted(
+        records,
+        key=lambda record: (
+            0 if record_pincode(record) == requested or requested in str(getattr(record, "address", "")) else 1,
+            str(getattr(record, "source_brand", "")),
+            str(getattr(record, "name", "")),
+        ),
+    )
+
+
 def build_registry() -> PluginRegistry:
     registry = PluginRegistry()
     registry.discover(BRANDS_DIR)
@@ -180,11 +201,13 @@ Examples:
         print("[Orchestrator] No records returned. Nothing to export.")
         return
 
+    records = sort_records_for_pincode(records, args.pincode)
+
     if args.verify_google:
         before_count = len(records)
         print(
             "[Orchestrator] Verifying with Google Places "
-            "(keeping operational businesses with phone numbers)..."
+            "(keeping operational businesses with or without phone numbers)..."
         )
         records = verify_records_with_google(
             records,
