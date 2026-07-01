@@ -36,6 +36,7 @@ GOOGLE_COLUMNS = [
     ("Google Business Type", "google_business_type"),
     ("Google Business Status", "google_business_status"),
     ("Google Location", "google_location"),
+    ("Google Name Match Score", "google_name_match_score"),
     ("Google Verification Status", "google_verification_status"),
     ("Google Verification Reason", "google_verification_reason"),
     ("Google Score",    "google_score"),

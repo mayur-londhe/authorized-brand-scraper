@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import fields, replace
+from difflib import SequenceMatcher
 import math
 import os
 import re
@@ -16,10 +17,38 @@ from .schema import DealerRecord
 PLACES_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 DEFAULT_SEARCH_TERMS = "building materials"
 DEFAULT_TIMEOUT = 15
+MIN_NAME_MATCH_SCORE = 0.62
+PREFERRED_RATING = 3.5
+PREFERRED_REVIEWS = 5
+GENERIC_COMPANY_WORDS = {
+    "building",
+    "buildings",
+    "material",
+    "materials",
+    "supplier",
+    "suppliers",
+    "supply",
+    "shop",
+    "shoppee",
+    "store",
+    "stores",
+    "trader",
+    "traders",
+    "trading",
+    "enterprise",
+    "enterprises",
+    "company",
+    "co",
+    "india",
+}
 
 
 def _clean_text(value: str) -> str:
-    return re.sub(r"\s+", " ", str(value or "").casefold()).strip()
+    return re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()),
+    ).strip()
 
 
 def _name_tokens(value: str) -> set[str]:
@@ -46,6 +75,23 @@ def _name_tokens(value: str) -> set[str]:
     }
 
 
+def _distinctive_tokens(value: str) -> set[str]:
+    return {
+        token for token in _name_tokens(value)
+        if token not in GENERIC_COMPANY_WORDS
+    }
+
+
+def _best_token_similarity(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return max(
+        SequenceMatcher(None, left_token, right_token).ratio()
+        for left_token in left
+        for right_token in right
+    )
+
+
 def get_place_display_name(place: dict) -> str:
     display_name = place.get("displayName") or {}
     if isinstance(display_name, dict):
@@ -53,11 +99,42 @@ def get_place_display_name(place: dict) -> str:
     return str(display_name or "").strip()
 
 
-def is_company_match(company_name: str, place_name: str) -> bool:
-    """Return True when the scraped company name appears in the Google place name."""
+def company_name_score(company_name: str, place_name: str) -> float:
+    """Score spelling similarity and shared significant words from 0 to 1."""
     company = _clean_text(company_name)
     place = _clean_text(place_name)
-    return bool(company and place) and company in place
+    if not company or not place:
+        return 0.0
+    company_tokens = _name_tokens(company)
+    place_tokens = _name_tokens(place)
+    token_score = (
+        len(company_tokens & place_tokens) / len(company_tokens | place_tokens)
+        if company_tokens and place_tokens
+        else 0.0
+    )
+    sequence_score = SequenceMatcher(None, company, place).ratio()
+    containment_score = 1.0 if company in place or place in company else 0.0
+    raw_score = max(
+        sequence_score,
+        0.65 * token_score + 0.35 * sequence_score,
+        0.85 * containment_score + 0.15 * sequence_score,
+    )
+
+    company_distinctive = _distinctive_tokens(company)
+    place_distinctive = _distinctive_tokens(place)
+    distinctive_score = _best_token_similarity(
+        company_distinctive,
+        place_distinctive,
+    )
+    if company_distinctive and place_distinctive and distinctive_score < 0.72:
+        return round(min(raw_score, 0.45), 4)
+    if not company_distinctive or not place_distinctive:
+        return round(raw_score if raw_score >= 0.90 else min(raw_score, 0.55), 4)
+    return round(0.8 * raw_score + 0.2 * distinctive_score, 4)
+
+
+def is_company_match(company_name: str, place_name: str) -> bool:
+    return company_name_score(company_name, place_name) >= MIN_NAME_MATCH_SCORE
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -128,7 +205,7 @@ def fetch_google_data(
             state=state,
             search_terms=search_terms,
         ),
-        "maxResultCount": 1,
+        "maxResultCount": 5,
     }
 
     response = requests.post(
@@ -143,10 +220,21 @@ def fetch_google_data(
     if not places:
         return None, "No Google Places result"
 
-    place = places[0]
+    scored_places = sorted(
+        (
+            (company_name_score(record.name, get_place_display_name(place)), place)
+            for place in places
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    match_score, place = scored_places[0]
     place_name = get_place_display_name(place)
-    if not place_name or not is_company_match(record.name, place_name):
-        return None, f"Name mismatch: {record.name} vs {place_name or 'N/A'}"
+    if not place_name or match_score < MIN_NAME_MATCH_SCORE:
+        return None, (
+            f"Name mismatch ({match_score:.0%}): "
+            f"{record.name} vs {place_name or 'N/A'}"
+        )
 
     rating = place.get("rating")
     reviews = place.get("userRatingCount")
@@ -168,6 +256,7 @@ def fetch_google_data(
         "google_business_status": place.get("businessStatus", ""),
         "google_place_id": place_id or place.get("name", ""),
         "google_location": google_location,
+        "google_name_match_score": round(match_score * 100, 1),
         "google_score": google_sort_score(rating, reviews),
     }
     if str(google_data["google_business_status"] or "").casefold() != "operational":
@@ -213,6 +302,8 @@ def sort_google_verified(records: Iterable[DealerRecord]) -> list[DealerRecord]:
     return sorted(
         records,
         key=lambda record: (
+            _safe_float(record.google_rating) >= PREFERRED_RATING
+            and _safe_int(record.google_reviews) >= PREFERRED_REVIEWS,
             _safe_float(record.google_score),
             _safe_float(record.google_rating),
             _safe_int(record.google_reviews),

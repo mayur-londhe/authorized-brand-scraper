@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import inspect
+import re
 import sys
 from pathlib import Path
 
@@ -66,14 +67,32 @@ def record_pincode(record) -> str:
     return explicit or pincode_from_address(getattr(record, "address", ""))
 
 
-def sort_records_for_pincode(records, pincode: str):
-    requested = str(pincode or "").strip()
+def parse_pincodes(value: str) -> list[str]:
+    return list(dict.fromkeys(re.findall(r"(?<!\d)[1-9]\d{5}(?!\d)", value or "")))
+
+
+def sort_records_for_pincodes(records, pincodes):
+    requested = list(pincodes)
     if not requested:
         return list(records)
+    priorities = {pincode: index for index, pincode in enumerate(requested)}
+
+    def priority(record):
+        found = record_pincode(record)
+        address = str(getattr(record, "address", "") or "")
+        return min(
+            (
+                priorities[pincode]
+                for pincode in requested
+                if found == pincode or pincode in address
+            ),
+            default=len(requested),
+        )
+
     return sorted(
         records,
         key=lambda record: (
-            0 if record_pincode(record) == requested or requested in str(getattr(record, "address", "")) else 1,
+            priority(record),
             str(getattr(record, "source_brand", "")),
             str(getattr(record, "name", "")),
         ),
@@ -108,7 +127,7 @@ def run_single(
     return records
 
 
-def run_all_brands(registry, category: str, state: str, city: str = "", pincode: str = ""):
+def run_all_brands(registry, category: str, state: str, city: str = "", pincodes=None):
     """Run all registered brands for a given MGEM category."""
     category_brands = get_category_brands(category)
 
@@ -118,9 +137,17 @@ def run_all_brands(registry, category: str, state: str, city: str = "", pincode:
         return []
 
     all_records = []
+    pincodes = list(pincodes or [""])
     for brand in category_brands:
-        recs = run_single(registry, brand, category, state, city, pincode)
-        all_records.extend(recs)
+        handler_cls = registry.get(brand)
+        active_pincodes = (
+            pincodes
+            if handler_cls and getattr(handler_cls, "REQUIRES_PINCODE", False)
+            else pincodes[:1]
+        )
+        for pincode in active_pincodes:
+            recs = run_single(registry, brand, category, state, city, pincode)
+            all_records.extend(recs)
 
     return all_records
 
@@ -143,7 +170,11 @@ Examples:
     parser.add_argument("--category", default="Fixtures", help="Product category")
     parser.add_argument("--state",    default="",         help="State name (required)")
     parser.add_argument("--city",     default="",         help="City name (required for Parryware)")
-    parser.add_argument("--pincode",  default="",         help="Pincode (required for Dr Fixit)")
+    parser.add_argument(
+        "--pincode",
+        default="",
+        help="One or more pincodes separated by commas or spaces",
+    )
     parser.add_argument("--output",   default="",         help="Custom output filename (.xlsx)")
     parser.add_argument(
         "--verify-google",
@@ -177,6 +208,7 @@ Examples:
         parser.print_help()
         sys.exit(1)
     category = canonical_category(args.category)
+    pincodes = parse_pincodes(args.pincode)
 
     if (
         brand_key in ("dr fixit", "drfixit", "all")
@@ -190,18 +222,26 @@ Examples:
     # ── Dispatch ──────────────────────────────────────────────────────
     if args.brand.lower() == "all":
         records = run_all_brands(
-            registry, category, args.state, args.city, args.pincode
+            registry, category, args.state, args.city, pincodes
         )
     else:
-        records = run_single(
-            registry, args.brand, category, args.state, args.city, args.pincode
+        handler_cls = registry.get(args.brand)
+        active_pincodes = (
+            pincodes
+            if handler_cls and getattr(handler_cls, "REQUIRES_PINCODE", False)
+            else pincodes[:1] or [""]
         )
+        records = []
+        for pincode in active_pincodes:
+            records.extend(run_single(
+                registry, args.brand, category, args.state, args.city, pincode
+            ))
 
     if not records:
         print("[Orchestrator] No records returned. Nothing to export.")
         return
 
-    records = sort_records_for_pincode(records, args.pincode)
+    records = sort_records_for_pincodes(records, pincodes)
 
     if args.verify_google:
         before_count = len(records)
@@ -213,7 +253,7 @@ Examples:
             records,
             state=args.state,
             city=args.city,
-            pincode=args.pincode,
+            pincode=pincodes[0] if pincodes else "",
             search_terms=args.google_search_terms or google_terms_for_category(args.category),
         )
         print(
@@ -224,7 +264,11 @@ Examples:
             return
 
     # ── Export ────────────────────────────────────────────────────────
-    filename = args.output or export_filename(args.category, args.city, args.pincode)
+    filename = args.output or export_filename(
+        args.category,
+        args.city,
+        "-".join(pincodes),
+    )
     out_path = export_to_xlsx(records, OUTPUT_DIR, filename=filename)
     print(f"\nDone. Output saved to: {out_path}")
 

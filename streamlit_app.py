@@ -24,6 +24,7 @@ from core import (
     records_without_duplicates,
 )
 from core.s3_storage import S3Storage
+from core.indiamart import run_indiamart_scrape
 import core.google_places as google_places_module
 import core.schema as schema_module
 
@@ -44,9 +45,14 @@ def load_storage(bucket_name: str, region: str) -> S3Storage:
     return S3Storage(bucket_name=bucket_name, region=region)
 
 
-def verify_records_with_google_including_unverified(records, **kwargs):
+def verify_records_with_google_current(
+    records,
+    *,
+    include_unverified: bool,
+    **kwargs,
+):
     """Verify using a coherent, current schema even after a Streamlit hot reload."""
-    kwargs["include_unverified"] = True
+    kwargs["include_unverified"] = include_unverified
     current_schema = importlib.reload(schema_module)
     current_google_places = importlib.reload(google_places_module)
     field_names = current_schema.DealerRecord.__dataclass_fields__
@@ -62,6 +68,14 @@ def verify_records_with_google_including_unverified(records, **kwargs):
     ]
     return current_google_places.verify_records_with_google(
         current_records,
+        **kwargs,
+    )
+
+
+def verify_records_with_google_including_unverified(records, **kwargs):
+    return verify_records_with_google_current(
+        records,
+        include_unverified=True,
         **kwargs,
     )
 
@@ -119,14 +133,32 @@ def record_pincode(record) -> str:
     return explicit or pincode_from_address(getattr(record, "address", ""))
 
 
-def records_for_pincode(records, pincode: str, *, keep_other_pincodes: bool):
-    requested = str(pincode or "").strip()
+def parse_pincodes(value: str) -> list[str]:
+    return list(dict.fromkeys(re.findall(r"(?<!\d)[1-9]\d{5}(?!\d)", value or "")))
+
+
+def records_for_pincodes(records, pincodes, *, keep_other_pincodes: bool):
+    requested = list(dict.fromkeys(str(pin).strip() for pin in pincodes if str(pin).strip()))
     if not requested:
         return list(records)
+    priorities = {pincode: index for index, pincode in enumerate(requested)}
+
+    def pincode_priority(record) -> int:
+        found = record_pincode(record)
+        address = str(getattr(record, "address", "") or "")
+        return min(
+            (
+                priorities[pincode]
+                for pincode in requested
+                if found == pincode or pincode in address
+            ),
+            default=len(requested),
+        )
+
     sorted_records = sorted(
         records,
         key=lambda record: (
-            0 if record_pincode(record) == requested or requested in str(getattr(record, "address", "")) else 1,
+            pincode_priority(record),
             str(getattr(record, "source_brand", "")),
             str(getattr(record, "name", "")),
         ),
@@ -135,8 +167,7 @@ def records_for_pincode(records, pincode: str, *, keep_other_pincodes: bool):
         return sorted_records
     return [
         record for record in sorted_records
-        if record_pincode(record) == requested
-        or requested in str(getattr(record, "address", ""))
+        if pincode_priority(record) < len(requested)
     ]
 
 
@@ -164,6 +195,7 @@ GOOGLE_DISPLAY_COLUMNS = {
     "google_business_type": "Google Business Type",
     "google_business_status": "Google Business Status",
     "google_location": "Google Location",
+    "google_name_match_score": "Google Name Match Score",
     "google_verification_status": "Google Verification Status",
     "google_verification_reason": "Google Verification Reason",
     "google_score": "Google Score",
@@ -181,6 +213,15 @@ HIDDEN_OUTPUT_COLUMNS = {
     "Google Directions",
 }
 GOOGLE_OUTPUT_COLUMNS = set(GOOGLE_DISPLAY_COLUMNS.values())
+B2B_PRODUCTS = {
+    "Flyash Brick": "fly-ash-bricks",
+    "AAC Block": "autoclaved-aerated-concrete-block",
+    "Cement Brick": "cement-brick",
+    "Concrete Block": "concrete-blocks",
+    "Hollow Clay Brick": "hollow-clay-bricks",
+    "CLC Block": "clc-block",
+    "Hollow Concrete Block": "concrete-hollow-blocks",
+}
 
 
 def is_duplicate_status(value) -> bool:
@@ -200,6 +241,56 @@ def find_column(dataframe: pd.DataFrame, options: set[str]) -> str | None:
 
 def blank_cell(value) -> bool:
     return value is None or pd.isna(value) or not str(value).strip()
+
+
+def sort_b2b_dataframe_for_pincodes(
+    dataframe: pd.DataFrame,
+    pincodes: list[str],
+) -> pd.DataFrame:
+    if dataframe.empty or not pincodes:
+        return dataframe
+    priorities = {pincode: index for index, pincode in enumerate(pincodes)}
+
+    def priority(row) -> int:
+        searchable = " ".join(
+            str(row.get(column, "") or "")
+            for column in ("Pin Location", "Address", "Google Full Address")
+        )
+        return min(
+            (priorities[pin] for pin in pincodes if pin in searchable),
+            default=len(pincodes),
+        )
+
+    ordered = dataframe.copy()
+    ordered["_pincode_priority"] = dataframe.apply(priority, axis=1)
+    ratings = pd.to_numeric(ordered.get("Rating"), errors="coerce").fillna(0)
+    reviews = pd.to_numeric(ordered.get("Review Count"), errors="coerce").fillna(0)
+    trustseal = ordered.get(
+        "Trust Seal / GST Verified",
+        pd.Series("", index=ordered.index),
+    ).astype(str).str.casefold().eq("yes")
+    ordered["_vendor_preferred"] = trustseal | (
+        ratings.ge(3.5) & reviews.ge(5)
+    )
+    ordered["_vendor_rating"] = ratings
+    ordered["_vendor_reviews"] = reviews
+    ordered = ordered.sort_values(
+        [
+            "_pincode_priority",
+            "_vendor_preferred",
+            "_vendor_rating",
+            "_vendor_reviews",
+            "Company Name",
+        ],
+        ascending=[True, False, False, False, True],
+        kind="stable",
+    )
+    return ordered.drop(columns=[
+        "_pincode_priority",
+        "_vendor_preferred",
+        "_vendor_rating",
+        "_vendor_reviews",
+    ]).reset_index(drop=True)
 
 
 def looks_like_map_url(value) -> bool:
@@ -561,10 +652,12 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
     left, middle, right = st.columns(3)
     state = left.text_input("State", placeholder="Karnataka")
     city = middle.text_input("City", placeholder="Bengaluru")
-    pincode = right.text_input(
-        "Pincode *",
-        placeholder="560001",
+    pincode_text = right.text_input(
+        "Pincodes *",
+        placeholder="560001, 560002",
+        help="Enter one or more six-digit pincodes separated by commas or spaces.",
     )
+    pincodes = parse_pincodes(pincode_text)
     city_required = [
         brand for brand in selected_brands
         if registry.get(brand) and registry.get(brand).REQUIRES_CITY
@@ -581,10 +674,14 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
         "brands": tuple(selected_brands),
         "state": state.strip(),
         "city": city.strip(),
-        "pincode": pincode.strip(),
+        "pincodes": tuple(pincodes),
     }
 
-    if st.button("Run", type="primary", use_container_width=True):
+    if st.button(
+        "Run Brand Authorized Directory",
+        type="primary",
+        use_container_width=True,
+    ):
         errors: list[str] = []
         records = []
         if not selected_brands:
@@ -596,13 +693,27 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
         if city_required and not city.strip():
             st.error("City is required for: " + ", ".join(city_required))
             return
-        if not re.fullmatch(r"[1-9]\d{5}", pincode.strip()):
-            st.error("Enter a valid 6-digit pincode.")
+        invalid_pincode_text = re.sub(r"[\s,;]+", "", pincode_text)
+        if not pincodes or invalid_pincode_text != "".join(pincodes):
+            st.error("Enter valid six-digit pincodes separated by commas or spaces.")
             return
 
+        jobs = []
+        for brand in selected_brands:
+            handler_class = registry.get(brand)
+            brand_pincodes = (
+                pincodes
+                if handler_class and getattr(handler_class, "REQUIRES_PINCODE", False)
+                else [pincodes[0]]
+            )
+            jobs.extend((brand, pin) for pin in brand_pincodes)
+
         progress = st.progress(0, text="Starting...")
-        for index, brand in enumerate(selected_brands, start=1):
-            progress.progress((index - 1) / len(selected_brands), text=f"Running {brand}...")
+        for index, (brand, active_pincode) in enumerate(jobs, start=1):
+            progress.progress(
+                (index - 1) / len(jobs),
+                text=f"Running {brand} for {active_pincode}...",
+            )
             try:
                 handler_class = registry.get(brand)
                 if handler_class is None:
@@ -612,20 +723,20 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
                     category=scraper_category,
                     state=state.strip(),
                     city=city.strip(),
-                    pincode=pincode.strip(),
+                    pincode=active_pincode,
                 ))
             except Exception as exc:
-                errors.append(f"{brand}: {exc}")
-            progress.progress(index / len(selected_brands), text=f"Finished {brand}")
+                errors.append(f"{brand} ({active_pincode}): {exc}")
+            progress.progress(index / len(jobs), text=f"Finished {brand}")
         progress.empty()
         raw_count = len(records)
         records = records_without_duplicates(records)
-        records = records_for_pincode(
+        records = records_for_pincodes(
             records,
-            pincode.strip(),
+            pincodes,
             keep_other_pincodes=True,
         )
-        filename = export_filename(category, city.strip(), pincode.strip())
+        filename = export_filename(category, city.strip(), "-".join(pincodes))
         _, saved_key, save_error = save_records_to_shared_files(
             records,
             filename=filename,
@@ -667,14 +778,14 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
             "after the requested pincode results."
         ),
     )
-    records = records_for_pincode(
+    records = records_for_pincodes(
         all_records,
-        pincode.strip(),
+        pincodes,
         keep_other_pincodes=keep_other_pincodes,
     )
 
     if not records:
-        st.info(f"No dealer records matched pincode {pincode.strip()}.")
+        st.info(f"No dealer records matched: {', '.join(pincodes)}.")
         return
 
     st.success(f"Found {len(records)} dealer records across {len(selected_brands)} brand(s).")
@@ -710,7 +821,7 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
                 records,
                 state=state.strip(),
                 city=city.strip(),
-                pincode=pincode.strip(),
+                pincode=pincodes[0],
                 search_terms=google_terms_for_category(category),
                 on_progress=update_google_progress,
             )
@@ -759,7 +870,7 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
 
 
 def render_s3_dashboard() -> None:
-    st.subheader("Saved files")
+    st.subheader("Output")
     region = active_region()
     bucket_name = active_bucket_name()
     if not bucket_name:
@@ -836,7 +947,8 @@ def render_s3_dashboard() -> None:
             key=f"download-selected-{selected_key}",
             use_container_width=True,
         )
-        render_file_preview(selected_key, data)
+        st.caption("The preview below reflects the selected row filters.")
+        render_file_preview(download_name, download_data)
 
     confirm_delete = st.checkbox("I confirm deletion of the selected file")
     if st.button("Delete selected file", disabled=not confirm_delete):
@@ -848,6 +960,219 @@ def render_s3_dashboard() -> None:
             st.rerun()
         except Exception as exc:
             st.error(f"Deletion failed: {exc}")
+
+
+def render_indiamart_dashboard() -> None:
+    st.subheader("B2B Directory")
+    st.caption(
+        "Scrape IndiaMART product listings by city in a headless browser. "
+        "TrustSEAL listings and listings rated at least 3.5 with at least 5 reviews "
+        "are retained by default."
+    )
+
+    left, right = st.columns(2)
+    city = left.text_input(
+        "City",
+        value="Indore",
+    )
+    selected_products = right.multiselect(
+        "Products",
+        options=list(B2B_PRODUCTS),
+        default=["Flyash Brick"],
+    )
+    b2b_pincode_text = st.text_input(
+        "Preferred pincodes for sorting",
+        placeholder="452001, 452002",
+        help="These pincodes sort B2B results only; they do not change the IndiaMART search.",
+    )
+    b2b_pincodes = parse_pincodes(b2b_pincode_text)
+    st.caption("Porotherm and the remaining planned products will be added when their slugs are available.")
+
+    if st.button(
+        "Run B2B Directory",
+        type="primary",
+        use_container_width=True,
+    ):
+        progress = st.progress(0, text="Starting IndiaMART scraper...")
+
+        def update_progress(done: int, total: int, label: str) -> None:
+            progress.progress(
+                done / total if total else 0,
+                text=f"IndiaMART: {label}",
+            )
+
+        try:
+            if not city.strip():
+                raise ValueError("Enter a city.")
+            if not selected_products:
+                raise ValueError("Select at least one product.")
+            rows = run_indiamart_scrape(
+                [city.strip()],
+                [B2B_PRODUCTS[product] for product in selected_products],
+                apply_quality_gate=True,
+                on_progress=update_progress,
+            )
+        except Exception as exc:
+            progress.empty()
+            st.error(f"IndiaMART scraping failed: {exc}")
+        else:
+            progress.empty()
+            dataframe = sort_b2b_dataframe_for_pincodes(
+                pd.DataFrame(rows),
+                b2b_pincodes,
+            )
+            csv_data = dataframe.to_csv(index=False).encode("utf-8-sig")
+            filename = (
+                "indiamart_leads_"
+                + datetime.now().strftime("%Y%m%d_%H%M%S")
+                + ".csv"
+            )
+            output_path = OUTPUT_DIR / filename
+            output_path.write_bytes(csv_data)
+            saved_key = None
+            save_error = None
+            if active_bucket_name():
+                try:
+                    storage = load_storage(active_bucket_name(), active_region())
+                    saved_key = storage.upload_path(
+                        output_path,
+                        key=f"exports/{filename}",
+                    )
+                except Exception as exc:
+                    save_error = str(exc)
+            st.session_state["indiamart_result"] = {
+                "dataframe": dataframe,
+                "csv_data": csv_data,
+                "filename": filename,
+                "saved_key": saved_key,
+                "save_error": save_error,
+            }
+
+    result = st.session_state.get("indiamart_result")
+    if not result:
+        return
+    dataframe = result["dataframe"].drop(
+        columns=["Product URL", "Product", "Company URL", "Website"],
+        errors="ignore",
+    )
+    dataframe = sort_b2b_dataframe_for_pincodes(dataframe, b2b_pincodes)
+    if len(dataframe.columns) != len(result["dataframe"].columns):
+        result["dataframe"] = dataframe
+        result["csv_data"] = dataframe.to_csv(index=False).encode("utf-8-sig")
+    status_column = (
+        dataframe["Google Verification Status"].astype(str).str.casefold()
+        if "Google Verification Status" in dataframe.columns
+        else pd.Series("", index=dataframe.index)
+    )
+    verified_count = int(status_column.eq("verified").sum())
+    unverified_count = len(dataframe) - verified_count
+    st.success(f"Found {len(dataframe)} IndiaMART leads.")
+    verified_metric, unverified_metric = st.columns(2)
+    verified_metric.metric("Verified vendors", verified_count)
+    unverified_metric.metric("Unverified vendors", unverified_count)
+    if result.get("saved_key"):
+        st.caption(f"Saved to shared files: {Path(result['saved_key']).name}")
+    elif result.get("save_error"):
+        st.warning(f"Local CSV created, but shared save failed: {result['save_error']}")
+
+    google_search_terms = st.text_input(
+        "Google Places search terms",
+        value="building materials",
+        key="indiamart-google-search-terms",
+    )
+    if st.button(
+        "Verify",
+        type="primary",
+        use_container_width=True,
+        disabled=dataframe.empty,
+    ):
+        source_rows = dataframe.to_dict(orient="records")
+        dealer_records = [
+            schema_module.DealerRecord(
+                name=str(row.get("Company Name", "") or ""),
+                address=str(row.get("Address", "") or ""),
+                city=str(row.get("City", "") or ""),
+                category=str(row.get("Subcategory", "") or ""),
+                phone=str(row.get("Phone", "") or ""),
+                website=str(row.get("Company URL", "") or ""),
+            )
+            for row in source_rows
+        ]
+        verify_progress = st.progress(
+            0,
+            text="Starting Google Places verification...",
+        )
+
+        def update_google_progress(index: int, total: int, record) -> None:
+            verify_progress.progress(
+                index / total if total else 0,
+                text=f"Checking {getattr(record, 'name', '') or 'IndiaMART lead'}...",
+            )
+
+        try:
+            verified_records = verify_records_with_google_current(
+                dealer_records,
+                include_unverified=True,
+                search_terms=google_search_terms.strip() or "building materials",
+                on_progress=update_google_progress,
+            )
+        except Exception as exc:
+            verify_progress.empty()
+            st.error(f"Google Places verification failed: {exc}")
+        else:
+            verify_progress.empty()
+            source_by_key = {
+                (
+                    str(row.get("Company Name", "") or "").strip().casefold(),
+                    str(row.get("Address", "") or "").strip().casefold(),
+                ): row
+                for row in source_rows
+            }
+            verified_rows = []
+            for record in verified_records:
+                key = (
+                    str(record.name or "").strip().casefold(),
+                    str(record.address or "").strip().casefold(),
+                )
+                row = dict(source_by_key.get(key, {}))
+                record_data = record.to_dict()
+                for field, label in GOOGLE_DISPLAY_COLUMNS.items():
+                    row[label] = record_data.get(field)
+                verified_rows.append(row)
+
+            verified_dataframe = pd.DataFrame(verified_rows)
+            verified_csv = verified_dataframe.to_csv(index=False).encode("utf-8-sig")
+            verified_filename = (
+                Path(result["filename"]).stem + "_google_checked.csv"
+            )
+            verified_path = OUTPUT_DIR / verified_filename
+            verified_path.write_bytes(verified_csv)
+            saved_key = None
+            save_error = None
+            if active_bucket_name():
+                try:
+                    storage = load_storage(active_bucket_name(), active_region())
+                    saved_key = storage.upload_path(
+                        verified_path,
+                        key=f"exports/{verified_filename}",
+                    )
+                except Exception as exc:
+                    save_error = str(exc)
+            st.session_state["indiamart_result"] = {
+                "dataframe": verified_dataframe,
+                "csv_data": verified_csv,
+                "filename": verified_filename,
+                "saved_key": saved_key,
+                "save_error": save_error,
+                "google_verified": True,
+            }
+            st.rerun()
+
+    if result.get("google_verified"):
+        st.info(
+            "This result includes both verified and unverified Google Places rows."
+        )
+    st.dataframe(dataframe, use_container_width=True, hide_index=True)
 
 
 def render_file_preview(key: str, data: bytes) -> None:
@@ -903,10 +1228,14 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.title("Dealer Finder")
-st.caption("Run brand sources and manage generated Excel files.")
+st.caption("Run dealer and IndiaMART scrapers and manage generated files.")
 
-scraper_tab, files_tab = st.tabs(["Run", "Saved files"])
+scraper_tab, indiamart_tab, files_tab = st.tabs(
+    ["Brand Authorized Directory", "B2B Directory", "Output"]
+)
 with scraper_tab:
     render_scraper_dashboard(load_registry())
+with indiamart_tab:
+    render_indiamart_dashboard()
 with files_tab:
     render_s3_dashboard()
