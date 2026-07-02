@@ -196,7 +196,7 @@ def export_to_xlsx(records: List[DealerRecord], output_dir: Path, filename: str 
             cell.alignment = Alignment(vertical="center", wrap_text=True)
             if field_key == "map_url" and val:
                 cell.hyperlink = val
-                cell.value = "Open Map"
+                cell.value = val
                 cell.font = Font(color="0563C1", underline="single")
             if field_key == "google_location" and val:
                 cell.hyperlink = val

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from typing import Callable, Iterable
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 
 CARD_SELECTOR = (
@@ -33,7 +33,15 @@ EXTRACT_CARDS_SCRIPT = r"""
     const ratingText = text('.dag5, [class*="rating"]');
     const ratingMatch = ratingText.match(/\d+(?:\.\d+)?/);
     const allText = card.innerText || '';
-    const reviewMatch = allText.match(/(\d[\d,]*)\s*(?:reviews?|ratings?)/i);
+    // IndiaMART commonly renders the count beside the rating as `4.3 (15)`.
+    // Keep the labelled form as a fallback for alternate card templates.
+    const bracketedReviewMatch = allText.match(
+        /(?:^|\s)[0-5](?:\.\d+)?\s*\(\s*(\d[\d,]*)\s*\)/
+    );
+    const labelledReviewMatch = allText.match(
+        /(\d[\d,]*)\s*(?:reviews?|ratings?)/i
+    );
+    const reviewMatch = bracketedReviewMatch || labelledReviewMatch;
     const trustText = [
         ...card.querySelectorAll('[class], [title], [aria-label], img')
     ].map(element => [
@@ -64,6 +72,37 @@ EXTRACT_CARDS_SCRIPT = r"""
 })
 """
 
+EXTRACT_COMPANY_DETAILS_SCRIPT = r"""
+() => {
+    const company = (window.__COMPANY_DATA__ || {}).company || {};
+    const text = selector => {
+        const element = document.querySelector(selector);
+        return element ? (element.innerText || element.textContent || '').trim() : '';
+    };
+    const ratingElement = document.querySelector(
+        '.rating-container, [aria-label*="stars from"]'
+    );
+    const ratingLabel = ratingElement
+        ? (ratingElement.getAttribute('aria-label') || '')
+        : '';
+    const ratingMatch = ratingLabel.match(/(\d+(?:\.\d+)?)\s+out of/i);
+    const reviewMatch = ratingLabel.match(/from\s+(\d[\d,]*)\s+(?:votes?|reviews?)/i);
+    return {
+        contactPerson: text('.footer__contact-name'),
+        address: text('.footer__address'),
+        phone: String(company.pnsNumber || '').trim(),
+        rating: company.seller_rating || (ratingMatch ? ratingMatch[1] : ''),
+        reviews: company.rating_count || (reviewMatch ? reviewMatch[1] : ''),
+        trustseal: Boolean(
+            document.querySelector(
+                'a[href*="/trustseal/"], .header-icon--trustseal, .ts-trigger'
+            )
+        ),
+        gstVerified: Boolean(company.gst_verified_flag)
+    };
+}
+"""
+
 
 def normalize_product_slugs(values: str | Iterable[str]) -> list[str]:
     candidates = re.split(r"[\n,;]+", values) if isinstance(values, str) else values
@@ -88,11 +127,17 @@ def normalize_cities(values: str | Iterable[str]) -> list[str]:
 def passes_quality_gate(record: dict) -> bool:
     return (
         record.get("TrustSEAL") == "Yes"
+        or record.get("Trust Seal / GST Verified") == "Yes"
         or (
             int(record.get("Review Count") or 0) >= 5
-            and float(record.get("Rating") or 0) >= 3.5
+            and float(record.get("Rating") or 0) >= 3.0
         )
     )
+
+
+def select_quality_records(records: Iterable[dict]) -> list[dict]:
+    """Keep sealed listings and listings meeting rating/review minimums."""
+    return [record for record in records if passes_quality_gate(record)]
 
 
 def product_dimension(product_name: str) -> str:
@@ -103,6 +148,26 @@ def product_dimension(product_name: str) -> str:
     if "," in value:
         return value.split(",", 1)[1].strip()
     return ""
+
+
+def indiamart_enquiry_url(company_url: str) -> str:
+    """Build IndiaMART's common company Contact Us endpoint."""
+    try:
+        parsed = urlsplit(str(company_url or "").strip())
+    except ValueError:
+        return ""
+    hostname = (parsed.hostname or "").casefold()
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if not hostname.endswith("indiamart.com") or not path_parts:
+        return ""
+    company_slug = path_parts[0]
+    return urlunsplit((
+        parsed.scheme or "https",
+        parsed.netloc,
+        f"/{company_slug}/enquiry.html",
+        "",
+        "",
+    ))
 
 
 def _text_lines(text: str) -> list[str]:
@@ -151,6 +216,13 @@ def _address_from_text(text: str) -> str:
         values = [match.group(1).strip(" :-")]
         for candidate in lines[index + 1:index + 5]:
             if stop.match(candidate):
+                break
+            if re.match(
+                r"^.{2,80}(?:\([^()]{2,30}\)|\|\s*"
+                r"(?:owner|proprietor|director|ceo|partner|manager))$",
+                candidate,
+                re.IGNORECASE,
+            ):
                 break
             if noise.match(candidate):
                 continue
@@ -277,8 +349,62 @@ async def extract_contact_details(context, company_url: str) -> dict:
 
     page = await context.new_page()
     try:
-        await page.goto(company_url, wait_until="domcontentloaded", timeout=25_000)
-        home_text = await page.locator("body").inner_text()
+        async def navigate(url: str):
+            response = None
+            for delay_ms in (0, 2_000, 5_000):
+                if delay_ms:
+                    await page.wait_for_timeout(delay_ms)
+                response = await page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=25_000,
+                )
+                if not response or response.status != 429:
+                    return response
+            return response
+
+        async def capture_page() -> str:
+            body = await page.locator("body").inner_text()
+            structured = await page.evaluate(EXTRACT_COMPANY_DETAILS_SCRIPT)
+            if structured.get("contactPerson"):
+                person_details = _contact_details_from_text(
+                    structured["contactPerson"]
+                )
+                if person_details["Contact Person"] and not details["Contact Person"]:
+                    details["Contact Person"] = person_details["Contact Person"]
+                if person_details["Role"] and not details["Role"]:
+                    details["Role"] = person_details["Role"]
+            if structured.get("address") and not details["Address"]:
+                details["Address"] = structured["address"]
+                pin_match = re.search(
+                    r"(?<!\d)[1-9]\d{5}(?!\d)",
+                    structured["address"],
+                )
+                if pin_match:
+                    details["Pin Location"] = pin_match.group(0)
+            if structured.get("phone") and not details["Contact Number"]:
+                details["Contact Number"] = re.sub(
+                    r"[\s-]+",
+                    "",
+                    structured["phone"],
+                )
+            if structured.get("trustseal") or structured.get("gstVerified"):
+                details["Trust Seal / GST Verified"] = "Yes"
+            if structured.get("rating") not in (None, ""):
+                details["Rating"] = float(structured["rating"])
+            if structured.get("reviews") not in (None, ""):
+                details["Review Count"] = int(
+                    str(structured["reviews"]).replace(",", "")
+                )
+            return body
+
+        canonical_enquiry_url = indiamart_enquiry_url(company_url)
+        initial_url = canonical_enquiry_url or company_url
+        initial_response = await navigate(initial_url)
+        if initial_response and initial_response.status == 429:
+            details["Contact Extraction Status"] = "Rate limited (HTTP 429)"
+            return details
+        home_text = await capture_page()
         contact_links = await page.locator("a").evaluate_all(
             """links => links.map(link => ({
                 text: (link.innerText || '').replace(/\\s+/g, ' ').trim(),
@@ -307,15 +433,28 @@ async def extract_contact_details(context, company_url: str) -> dict:
             urljoin(base, "contact-us.html"),
             urljoin(base, "contactus.html"),
         ]))
+        candidate_urls = [
+            url for url in candidate_urls
+            if url and url.rstrip("/") != initial_url.rstrip("/")
+        ]
         contact_texts = []
-        for contact_url in candidate_urls:
+        if home_text:
+            contact_texts.append(home_text)
+
+        # The canonical IndiaMART enquiry page contains all structured company
+        # data. Only try alternate URLs when that primary page lacked details.
+        needs_fallback = not any((
+            details["Contact Person"],
+            details["Contact Number"],
+            details["Address"],
+            details["Trust Seal / GST Verified"] == "Yes",
+        ))
+        for contact_url in candidate_urls if needs_fallback else []:
             try:
-                await page.goto(
-                    contact_url,
-                    wait_until="domcontentloaded",
-                    timeout=20_000,
-                )
-                body = await page.locator("body").inner_text()
+                response = await navigate(contact_url)
+                if response and response.status == 429:
+                    continue
+                body = await capture_page()
                 if body and body not in contact_texts:
                     contact_texts.append(body)
             except Exception:
@@ -367,7 +506,7 @@ async def scrape_indiamart(
     max_scrolls: int = 30,
     on_progress: Callable[[int, int, str], None] | None = None,
 ) -> list[dict]:
-    """Scrape IndiaMART directory cards using a strictly headless browser."""
+    """Scrape IndiaMART cards in a visible browser for debugging."""
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:
@@ -388,7 +527,8 @@ async def scrape_indiamart(
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
-            headless=True,
+            headless=False,
+            slow_mo=250,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
         context = await browser.new_context(
@@ -424,7 +564,7 @@ async def scrape_indiamart(
                         break
 
                 found = await page.evaluate(EXTRACT_CARDS_SCRIPT, CARD_SELECTOR)
-                accepted = []
+                candidates = []
                 for record in found:
                     record["City"] = city
                     record["Subcategory"] = slug.replace("-", " ").title()
@@ -441,12 +581,10 @@ async def scrape_indiamart(
                     )
                     if not key[0] or key in seen:
                         continue
-                    if apply_quality_gate and not passes_quality_gate(record):
-                        continue
-                    seen.add(key)
-                    accepted.append(record)
+                    candidates.append((key, record))
 
-                semaphore = asyncio.Semaphore(6)
+                # IndiaMART rate-limits concurrent company-page navigation.
+                semaphore = asyncio.Semaphore(1)
 
                 async def enrich_contact(record):
                     async with semaphore:
@@ -454,6 +592,7 @@ async def scrape_indiamart(
                             context,
                             str(record.get("Company URL", "")),
                         )
+                        await asyncio.sleep(0.75)
                     listing_address = record.get("Address", "")
                     record.update(details)
                     if not record.get("Address"):
@@ -473,9 +612,14 @@ async def scrape_indiamart(
                     record.pop("GST Badge", None)
                     return record
 
-                records.extend(await asyncio.gather(*(
-                    enrich_contact(record) for record in accepted
-                )))
+                enriched = await asyncio.gather(*(
+                    enrich_contact(record) for _, record in candidates
+                ))
+                for (key, _), record in zip(candidates, enriched):
+                    if apply_quality_gate and not passes_quality_gate(record):
+                        continue
+                    seen.add(key)
+                    records.append(record)
                 if on_progress:
                     on_progress(index, len(searches), label)
         finally:

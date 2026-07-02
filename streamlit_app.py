@@ -270,7 +270,7 @@ def sort_b2b_dataframe_for_pincodes(
         pd.Series("", index=ordered.index),
     ).astype(str).str.casefold().eq("yes")
     ordered["_vendor_preferred"] = trustseal | (
-        ratings.ge(3.5) & reviews.ge(5)
+        ratings.ge(3.0) & reviews.ge(5)
     )
     ordered["_vendor_rating"] = ratings
     ordered["_vendor_reviews"] = reviews
@@ -415,7 +415,6 @@ def render_duplicate_dataframe(dataframe: pd.DataFrame, preview_limit: int | Non
     if "Google Maps" in visible_dataframe.columns:
         column_config["Google Maps"] = st.column_config.LinkColumn(
             "Google Maps",
-            display_text="Open Map",
         )
     if "Google Location" in visible_dataframe.columns:
         column_config["Google Location"] = st.column_config.LinkColumn(
@@ -517,8 +516,12 @@ def dataframe_to_xlsx_bytes(dataframe: pd.DataFrame) -> bytes:
     for col_index, column in enumerate(dataframe.columns, start=1):
         sheet.cell(row=1, column=col_index, value=str(column))
     for row_index, (_, row) in enumerate(dataframe.iterrows(), start=2):
-        for col_index, value in enumerate(row, start=1):
-            sheet.cell(row=row_index, column=col_index, value="" if pd.isna(value) else value)
+        for col_index, (column, value) in enumerate(row.items(), start=1):
+            cell_value = "" if pd.isna(value) else value
+            cell = sheet.cell(row=row_index, column=col_index, value=cell_value)
+            if str(column) == "Google Maps" and looks_like_map_url(cell_value):
+                cell.hyperlink = str(cell_value)
+                cell.style = "Hyperlink"
     workbook.save(output)
     return output.getvalue()
 
@@ -918,9 +921,10 @@ def render_s3_dashboard() -> None:
 
     if st.session_state.get("s3_selected_key") == selected_key:
         data = st.session_state.get("s3_selected_data", b"")
-        without_duplicates = st.checkbox(
-            "Download without duplicate rows",
-            key=f"without-duplicates-{selected_key}",
+        include_duplicates = st.checkbox(
+            "Include duplicate rows",
+            value=True,
+            key=f"include-duplicates-{selected_key}",
         )
         include_unverified = st.checkbox(
             "Include unverified Google rows",
@@ -931,7 +935,7 @@ def render_s3_dashboard() -> None:
             download_data, download_name, download_mime = saved_file_download_payload(
                 selected_key,
                 data,
-                without_duplicates=without_duplicates,
+                without_duplicates=not include_duplicates,
                 include_unverified=include_unverified,
             )
         except Exception as exc:
@@ -965,9 +969,9 @@ def render_s3_dashboard() -> None:
 def render_indiamart_dashboard() -> None:
     st.subheader("B2B Directory")
     st.caption(
-        "Scrape IndiaMART product listings by city in a headless browser. "
-        "TrustSEAL listings and listings rated at least 3.5 with at least 5 reviews "
-        "are retained by default."
+        "Scrape IndiaMART listings in a visible browser (debug mode). "
+        "Listings are retained when a TrustSEAL is found on the card or company "
+        "page, or when they have at least 3 stars and 5 reviews."
     )
 
     left, right = st.columns(2)
