@@ -43,6 +43,9 @@ class DealerRecord:
     google_place_id: Optional[str] = None
     google_location: Optional[str] = None
     google_name_match_score: Optional[float] = None
+    google_distance_km: Optional[float] = None
+    google_notes: Optional[str] = None
+    google_pinlocation: Optional[str] = None
     google_verification_status: Optional[str] = None
     google_verification_reason: Optional[str] = None
     google_score: Optional[float] = None

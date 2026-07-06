@@ -1,6 +1,7 @@
 """Web interface for scraping dealers and managing generated S3 files."""
 
 from datetime import datetime
+from dataclasses import replace
 import importlib
 from io import BytesIO
 import inspect
@@ -21,7 +22,6 @@ from core import (
     google_maps_url,
     pincode_from_address,
     records_with_duplicate_status,
-    records_without_duplicates,
 )
 from core.s3_storage import S3Storage
 from core.indiamart import run_indiamart_scrape
@@ -80,6 +80,28 @@ def verify_records_with_google_including_unverified(records, **kwargs):
     )
 
 
+def verify_brand_records_with_google_v2_current(records, **kwargs):
+    """Run Brand V2 using the current hot-reloaded schema."""
+    current_schema = importlib.reload(schema_module)
+    current_google_places = importlib.reload(google_places_module)
+    field_names = current_schema.DealerRecord.__dataclass_fields__
+    current_records = [
+        current_schema.DealerRecord(
+            **{
+                name: getattr(record, name)
+                for name in field_names
+                if hasattr(record, name)
+            }
+        )
+        for record in records
+    ]
+    return current_google_places.verify_brand_records_with_google_v2(
+        current_records,
+        include_unverified=True,
+        **kwargs,
+    )
+
+
 def available_brands(registry: PluginRegistry, category: str) -> list[str]:
     installed = {name.casefold(): name for name in registry.list_brands()}
     return [
@@ -128,46 +150,50 @@ def fetch_records(handler, category: str, state: str, city: str, pincode: str = 
     return handler.fetch(**kwargs)
 
 
-def record_pincode(record) -> str:
-    explicit = str(getattr(record, "pincode", "") or "").strip()
-    return explicit or pincode_from_address(getattr(record, "address", ""))
-
-
 def parse_pincodes(value: str) -> list[str]:
     return list(dict.fromkeys(re.findall(r"(?<!\d)[1-9]\d{5}(?!\d)", value or "")))
 
 
-def records_for_pincodes(records, pincodes, *, keep_other_pincodes: bool):
-    requested = list(dict.fromkeys(str(pin).strip() for pin in pincodes if str(pin).strip()))
-    if not requested:
-        return list(records)
+def records_for_google_pincodes(records, pincodes, *, keep_other_pincodes: bool):
+    """Extract Google-address pincodes, then prioritize/filter requested ones."""
+    requested = list(dict.fromkeys(
+        str(pin).strip() for pin in pincodes if str(pin).strip()
+    ))
     priorities = {pincode: index for index, pincode in enumerate(requested)}
-
-    def pincode_priority(record) -> int:
-        found = record_pincode(record)
-        address = str(getattr(record, "address", "") or "")
-        return min(
-            (
-                priorities[pincode]
-                for pincode in requested
-                if found == pincode or pincode in address
+    enriched_records = [
+        replace(
+            record,
+            pincode=(
+                pincode_from_address(
+                    getattr(record, "google_full_address", "")
+                )
+                or str(getattr(record, "pincode", "") or "")
             ),
-            default=len(requested),
+        )
+        for record in records
+    ]
+    if not requested:
+        return enriched_records
+
+    def priority(record) -> int:
+        return priorities.get(
+            str(getattr(record, "pincode", "") or ""),
+            len(requested),
         )
 
     sorted_records = sorted(
-        records,
+        enriched_records,
         key=lambda record: (
-            pincode_priority(record),
-            str(getattr(record, "source_brand", "")),
-            str(getattr(record, "name", "")),
+            priority(record),
+            -float(getattr(record, "google_rating", 0) or 0),
+            -int(getattr(record, "google_reviews", 0) or 0),
         ),
     )
     if keep_other_pincodes:
         return sorted_records
     return [
         record for record in sorted_records
-        if pincode_priority(record) < len(requested)
+        if priority(record) < len(requested)
     ]
 
 
@@ -196,6 +222,9 @@ GOOGLE_DISPLAY_COLUMNS = {
     "google_business_status": "Google Business Status",
     "google_location": "Google Location",
     "google_name_match_score": "Google Name Match Score",
+    "google_distance_km": "Distance from Anchor (km)",
+    "google_notes": "Notes",
+    "google_pinlocation": "Matched Pinlocation",
     "google_verification_status": "Google Verification Status",
     "google_verification_reason": "Google Verification Reason",
     "google_score": "Google Score",
@@ -221,6 +250,22 @@ B2B_PRODUCTS = {
     "Hollow Clay Brick": "hollow-clay-bricks",
     "CLC Block": "clc-block",
     "Hollow Concrete Block": "concrete-hollow-blocks",
+}
+
+BRAND_V2_DISPLAY_COLUMNS = {
+    "source_brand": "Source Brand(s)",
+    "name": "Source Dealer Name",
+    "phone": "Source Phone",
+    "google_full_address": "Matched Address",
+    "google_contact_number": "Google Phone",
+    "google_rating": "Rating",
+    "google_reviews": "Review Count",
+    "city": "City",
+    "state": "State",
+    "pincode": "Pincode",
+    "google_distance_km": "Distance from Anchor (km)",
+    "google_notes": "Notes",
+    "google_pinlocation": "Matched Pinlocation",
 }
 
 
@@ -421,10 +466,19 @@ def render_duplicate_dataframe(dataframe: pd.DataFrame, preview_limit: int | Non
             "Google Location",
             display_text="Open Map",
         )
+    if "Matched Pinlocation" in visible_dataframe.columns:
+        column_config["Matched Pinlocation"] = st.column_config.LinkColumn(
+            "Matched Pinlocation",
+        )
     if "Website" in visible_dataframe.columns:
         column_config["Website"] = st.column_config.LinkColumn("Website")
 
-    link_columns = {"Google Maps", "Google Location", "Website"}
+    link_columns = {
+        "Google Maps",
+        "Google Location",
+        "Matched Pinlocation",
+        "Website",
+    }
     if link_columns & set(visible_dataframe.columns):
         table = visible_dataframe
     else:
@@ -519,7 +573,10 @@ def dataframe_to_xlsx_bytes(dataframe: pd.DataFrame) -> bytes:
         for col_index, (column, value) in enumerate(row.items(), start=1):
             cell_value = "" if pd.isna(value) else value
             cell = sheet.cell(row=row_index, column=col_index, value=cell_value)
-            if str(column) == "Google Maps" and looks_like_map_url(cell_value):
+            if (
+                str(column) in {"Google Maps", "Matched Pinlocation"}
+                and looks_like_map_url(cell_value)
+            ):
                 cell.hyperlink = str(cell_value)
                 cell.style = "Hyperlink"
     workbook.save(output)
@@ -609,6 +666,16 @@ def render_records_table(records) -> None:
     render_duplicate_dataframe(dataframe)
 
 
+def render_brand_v2_table(records) -> None:
+    dataframe = pd.DataFrame([record.to_dict() for record in records])
+    columns = [
+        column for column in BRAND_V2_DISPLAY_COLUMNS
+        if column in dataframe.columns
+    ]
+    dataframe = dataframe[columns].rename(columns=BRAND_V2_DISPLAY_COLUMNS)
+    render_duplicate_dataframe(dataframe)
+
+
 def records_download_dataframe(records) -> pd.DataFrame:
     rows = records_with_duplicate_status(records)
     dataframe = pd.DataFrame(rows)
@@ -618,6 +685,35 @@ def records_download_dataframe(records) -> pd.DataFrame:
     return enrich_location_columns(dataframe)
 
 
+def brand_v2_download_dataframe(records) -> pd.DataFrame:
+    """Build the compact post-verification brand download."""
+    columns = [
+        "Category",
+        "Source Dealer Name",
+        "Source Phone",
+        "Google Phone",
+        "Matched Address",
+        "City",
+        "Matched Pinlocation",
+    ]
+    verified = [
+        record for record in records
+        if bool(getattr(record, "google_verified", False))
+    ]
+    return pd.DataFrame([
+        {
+            "Category": record.category,
+            "Source Dealer Name": record.name,
+            "Source Phone": record.phone,
+            "Google Phone": record.google_contact_number,
+            "Matched Address": record.google_full_address,
+            "City": record.city,
+            "Matched Pinlocation": record.google_pinlocation,
+        }
+        for record in verified
+    ], columns=columns)
+
+
 def save_records_to_shared_files(
     records,
     *,
@@ -625,6 +721,27 @@ def save_records_to_shared_files(
     bucket_name: str,
 ) -> tuple[Path, str | None, str | None]:
     output_path = export_to_xlsx(records, OUTPUT_DIR, filename)
+    if not bucket_name:
+        return output_path, None, None
+    try:
+        storage = load_storage(bucket_name, active_region())
+        key = storage.upload_path(output_path, key=f"exports/{filename}")
+        return output_path, key, None
+    except Exception as exc:
+        return output_path, None, str(exc)
+
+
+def save_brand_v2_to_shared_files(
+    records,
+    *,
+    filename: str,
+    bucket_name: str,
+) -> tuple[Path, str | None, str | None]:
+    output_path = OUTPUT_DIR / filename
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(
+        dataframe_to_xlsx_bytes(brand_v2_download_dataframe(records))
+    )
     if not bucket_name:
         return output_path, None, None
     try:
@@ -733,12 +850,6 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
             progress.progress(index / len(jobs), text=f"Finished {brand}")
         progress.empty()
         raw_count = len(records)
-        records = records_without_duplicates(records)
-        records = records_for_pincodes(
-            records,
-            pincodes,
-            keep_other_pincodes=True,
-        )
         filename = export_filename(category, city.strip(), "-".join(pincodes))
         _, saved_key, save_error = save_records_to_shared_files(
             records,
@@ -773,23 +884,15 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
         return
 
     keep_other_pincodes = st.checkbox(
-        "Keep dealers from other pincodes",
+        "After Google verification, keep dealers from other pincodes",
         value=False,
-        key="keep-other-pincodes-after-scrape",
+        key="keep-other-pincodes-after-google",
         help=(
-            "When enabled, dealers outside the requested pincode are retained "
-            "after the requested pincode results."
+            "Google Full Address supplies the pincode. When enabled, unmatched "
+            "or other-pincode dealers remain after requested-pincode results."
         ),
     )
-    records = records_for_pincodes(
-        all_records,
-        pincodes,
-        keep_other_pincodes=keep_other_pincodes,
-    )
-
-    if not records:
-        st.info(f"No dealer records matched: {', '.join(pincodes)}.")
-        return
+    records = all_records
 
     st.success(f"Found {len(records)} dealer records across {len(selected_brands)} brand(s).")
     if result.get("raw_count", len(all_records)) != len(all_records):
@@ -808,8 +911,8 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
         type="primary",
         use_container_width=True,
         help=(
-            "Keeps Google operational businesses whether or not a phone number is available, "
-            "then sorts by Google rating and review count."
+            "Uses coordinates, pincode, or road/city geocoding as an anchor; "
+            "then independently checks distance, address overlap, and name."
         ),
     ):
         before_count = len(records)
@@ -820,12 +923,10 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
             verify_progress.progress(index / total, text=f"Checking {name}...")
 
         try:
-            verified_records = verify_records_with_google_including_unverified(
+            verified_records = verify_brand_records_with_google_v2_current(
                 records,
                 state=state.strip(),
                 city=city.strip(),
-                pincode=pincodes[0],
-                search_terms=google_terms_for_category(category),
                 on_progress=update_google_progress,
             )
         except Exception as exc:
@@ -833,7 +934,12 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
             st.error(f"Google Places verification failed: {exc}")
             return
         verify_progress.empty()
-        _, verified_saved_key, verified_save_error = save_records_to_shared_files(
+        verified_records = records_for_google_pincodes(
+            verified_records,
+            pincodes,
+            keep_other_pincodes=keep_other_pincodes,
+        )
+        _, verified_saved_key, verified_save_error = save_brand_v2_to_shared_files(
             verified_records,
             filename=result["filename"],
             bucket_name=bucket_name,
@@ -863,9 +969,16 @@ def render_scraper_dashboard(registry: PluginRegistry) -> None:
         f"Unverified rows shown: {unverified_count}."
     )
     if not verified_records:
+        if keep_other_pincodes:
+            st.warning("Google Places did not return any dealer records.")
+        else:
+            st.warning(
+                "No Google Full Address matched the requested pincode(s): "
+                + ", ".join(pincodes)
+            )
         return
 
-    render_records_table(verified_records)
+    render_brand_v2_table(verified_records)
     if verified_result.get("saved_key"):
         st.caption(f"Replaced saved file: {Path(verified_result['saved_key']).name}")
     elif verified_result.get("save_error"):
