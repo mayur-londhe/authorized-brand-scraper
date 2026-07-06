@@ -155,23 +155,20 @@ def parse_pincodes(value: str) -> list[str]:
 
 
 def records_for_google_pincodes(records, pincodes, *, keep_other_pincodes: bool):
-    """Extract Google-address pincodes, then prioritize/filter requested ones."""
+    """Filter verified rows by Google pincode while retaining rejected rows."""
     requested = list(dict.fromkeys(
         str(pin).strip() for pin in pincodes if str(pin).strip()
     ))
     priorities = {pincode: index for index, pincode in enumerate(requested)}
-    enriched_records = [
-        replace(
-            record,
-            pincode=(
-                pincode_from_address(
-                    getattr(record, "google_full_address", "")
-                )
-                or str(getattr(record, "pincode", "") or "")
-            ),
-        )
-        for record in records
-    ]
+    enriched_records = []
+    for record in records:
+        google_address = str(
+            getattr(record, "google_full_address", "") or ""
+        ).strip()
+        google_pincode = pincode_from_address(google_address)
+        if google_address and not google_pincode:
+            google_pincode = str(getattr(record, "pincode", "") or "")
+        enriched_records.append(replace(record, pincode=google_pincode))
     if not requested:
         return enriched_records
 
@@ -181,8 +178,16 @@ def records_for_google_pincodes(records, pincodes, *, keep_other_pincodes: bool)
             len(requested),
         )
 
-    sorted_records = sorted(
-        enriched_records,
+    verified = [
+        record for record in enriched_records
+        if bool(getattr(record, "google_verified", False))
+    ]
+    unverified = [
+        record for record in enriched_records
+        if not bool(getattr(record, "google_verified", False))
+    ]
+    sorted_verified = sorted(
+        verified,
         key=lambda record: (
             priority(record),
             -float(getattr(record, "google_rating", 0) or 0),
@@ -190,11 +195,12 @@ def records_for_google_pincodes(records, pincodes, *, keep_other_pincodes: bool)
         ),
     )
     if keep_other_pincodes:
-        return sorted_records
-    return [
-        record for record in sorted_records
+        return sorted_verified + unverified
+    matched_verified = [
+        record for record in sorted_verified
         if priority(record) < len(requested)
     ]
+    return matched_verified + unverified
 
 
 BASE_DISPLAY_COLUMNS = {
@@ -232,7 +238,6 @@ GOOGLE_DISPLAY_COLUMNS = {
 
 DUPLICATE_STATUS_COLUMN = "Duplicate Status"
 HIDDEN_OUTPUT_COLUMNS = {
-    "Duplicate Status",
     "State Query",
     "Latitude",
     "Longitude",
@@ -264,6 +269,8 @@ BRAND_V2_DISPLAY_COLUMNS = {
     "state": "State",
     "pincode": "Pincode",
     "google_distance_km": "Distance from Anchor (km)",
+    "google_verification_status": "Verification Status",
+    "google_verification_reason": "Failure Reason",
     "google_notes": "Notes",
     "google_pinlocation": "Matched Pinlocation",
 }
@@ -397,14 +404,19 @@ def add_duplicate_status_if_possible(dataframe: pd.DataFrame) -> pd.DataFrame:
         return dataframe
 
     address_column = find_column(dataframe, {"address"})
-    if not address_column:
+    name_column = find_column(
+        dataframe,
+        {"dealer name", "source dealer name", "name"},
+    )
+    if not address_column or not name_column:
         return dataframe
 
     keys = []
     counts = {}
     for _, row in dataframe.iterrows():
+        name = normalized_text(row.get(name_column, ""))
         address = normalized_text(row.get(address_column, ""))
-        key = address if address else None
+        key = (name, address) if name and address else None
         keys.append(key)
         if key is not None:
             counts[key] = counts.get(key, 0) + 1
@@ -695,10 +707,8 @@ def brand_v2_download_dataframe(records) -> pd.DataFrame:
         "Matched Address",
         "City",
         "Matched Pinlocation",
-    ]
-    verified = [
-        record for record in records
-        if bool(getattr(record, "google_verified", False))
+        "Verification Status",
+        "Failure Reason",
     ]
     return pd.DataFrame([
         {
@@ -709,8 +719,10 @@ def brand_v2_download_dataframe(records) -> pd.DataFrame:
             "Matched Address": record.google_full_address,
             "City": record.city,
             "Matched Pinlocation": record.google_pinlocation,
+            "Verification Status": record.google_verification_status,
+            "Failure Reason": record.google_verification_reason,
         }
-        for record in verified
+        for record in records
     ], columns=columns)
 
 

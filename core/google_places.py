@@ -41,6 +41,16 @@ GENERIC_COMPANY_WORDS = {
     "trading",
     "enterprise",
     "enterprises",
+    "electrical",
+    "electricals",
+    "electronic",
+    "electronics",
+    "hardware",
+    "light",
+    "lights",
+    "appliance",
+    "appliances",
+    "marketing",
     "company",
     "co",
     "india",
@@ -67,6 +77,8 @@ def _name_tokens(value: str) -> set[str]:
         "distributors",
         "authorized",
         "authorised",
+        "sub",
+        "branch",
         "private",
         "limited",
         "pvt",
@@ -117,9 +129,15 @@ def company_name_score(company_name: str, place_name: str) -> float:
         else 0.0
     )
     sequence_score = SequenceMatcher(None, company, place).ratio()
+    compact_sequence_score = SequenceMatcher(
+        None,
+        company.replace(" ", ""),
+        place.replace(" ", ""),
+    ).ratio()
     containment_score = 1.0 if company in place or place in company else 0.0
     raw_score = max(
         sequence_score,
+        compact_sequence_score,
         0.65 * token_score + 0.35 * sequence_score,
         0.85 * containment_score + 0.15 * sequence_score,
     )
@@ -130,6 +148,8 @@ def company_name_score(company_name: str, place_name: str) -> float:
         company_distinctive,
         place_distinctive,
     )
+    if compact_sequence_score >= 0.85:
+        return round(raw_score, 4)
     if company_distinctive and place_distinctive and distinctive_score < 0.72:
         return round(min(raw_score, 0.45), 4)
     if not company_distinctive or not place_distinctive:
@@ -193,6 +213,10 @@ def _geocode(query: str, *, api_key: str, timeout: int) -> dict | None:
     )
     response.raise_for_status()
     payload = response.json()
+    status = str(payload.get("status") or "")
+    if status not in {"OK", "ZERO_RESULTS"}:
+        message = str(payload.get("error_message") or status or "Unknown error")
+        raise RuntimeError(f"Geocoding API {status}: {message}")
     results = payload.get("results") or []
     return results[0] if results else None
 
@@ -233,6 +257,9 @@ def _address_tokens(value: str) -> set[str]:
     ignored = {
         "india", "karnataka", "road", "street", "building", "shop",
         "floor", "near", "opposite", "opp", "district", "taluk",
+        "complex", "layout", "colony", "ward", "cross", "main",
+        "extension", "extn", "beside", "ground", "first", "second",
+        "third", "number", "no",
     }
     cleaned = _clean_text(value)
     cleaned = re.sub(r"\b([a-z])\s+([a-z])\b", r"\1\2", cleaned)
@@ -285,19 +312,25 @@ def _brand_anchor(
             api_key=api_key,
             timeout=timeout,
         )
-        return _geocode_coordinates(result), ["pincode-centroid-anchor"]
+        pincode_anchor = _geocode_coordinates(result)
+        if pincode_anchor:
+            return pincode_anchor, ["pincode-centroid-anchor"]
 
-    road_query = " ".join(filter(None, (
-        record.address,
-        resolved_city,
-        resolved_state,
-        "India",
-    )))
-    road_anchor = _geocode_coordinates(_geocode(
-        road_query,
-        api_key=api_key,
-        timeout=timeout,
-    ))
+    if str(record.address or "").strip():
+        road_query = " ".join(filter(None, (
+            record.address,
+            resolved_city,
+            resolved_state,
+            "India",
+        )))
+        road_anchor = _geocode_coordinates(_geocode(
+            road_query,
+            api_key=api_key,
+            timeout=timeout,
+        ))
+    else:
+        road_anchor = None
+
     city_query = " ".join(filter(None, (resolved_city, resolved_state, "India")))
     city_anchor = _geocode_coordinates(_geocode(
         city_query,

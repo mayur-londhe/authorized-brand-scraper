@@ -60,16 +60,17 @@ def _normalize_duplicate_value(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
 
 
-def _duplicate_key(record: DealerRecord) -> tuple[str, str] | None:
+def _duplicate_key(record: DealerRecord) -> tuple[str, str, str] | None:
+    name = _normalize_duplicate_value(record.name)
     address = _normalize_duplicate_value(record.address)
-    if not address:
+    if not name or not address:
         return None
-    return ("address", address)
+    return ("name_address", name, address)
 
 
 def _duplicate_statuses(records: List[DealerRecord]) -> list[str]:
-    first_rows: dict[tuple[str, str], int] = {}
-    counts: dict[tuple[str, str], int] = {}
+    first_rows: dict[tuple[str, str, str], int] = {}
+    counts: dict[tuple[str, str, str], int] = {}
     keys = [_duplicate_key(record) for record in records]
 
     for key in keys:
@@ -144,7 +145,7 @@ def records_with_duplicate_status(records: List[DealerRecord]) -> list[dict]:
 
 
 def records_without_duplicates(records: List[DealerRecord]) -> list[DealerRecord]:
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     unique_records = []
     for record in records:
         key = _duplicate_key(record)

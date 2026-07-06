@@ -45,8 +45,8 @@ class AtombergHandler(BaseBrandHandler):
         state = self._normalize(state)
         city = self._normalize(city)
         pincode = self._normalize(pincode)
-        if not pincode:
-            raise ValueError("Pincode is required for Atomberg.")
+        if not self.PINCODE_RE.fullmatch(pincode):
+            raise ValueError("A valid six-digit pincode is required for Atomberg.")
 
         failures = []
         # Keep browser automation hidden; modal handling is performed in-page.
@@ -56,10 +56,7 @@ class AtombergHandler(BaseBrandHandler):
                 records = self._scrape_browser(
                     category, state, city, pincode, headless=headless
                 )
-                if records:
-                    return records
-                failures.append(f"{mode}: 0 rendered cards for pincode")
-                print(f"[Atomberg] {failures[-1]}")
+                return records
             except Exception as exc:
                 message = str(exc).splitlines()[0].strip() or "browser timed out"
                 failures.append(f"{mode}: {type(exc).__name__}: {message}")
@@ -143,6 +140,7 @@ class AtombergHandler(BaseBrandHandler):
                 field.clear()
                 field.send_keys(pincode)
             time.sleep(0.5)
+            self._select_pincode_suggestion(driver, pincode)
 
             stage = "clicking Atomberg search button"
             search = wait.until(lambda browser: self._search_button(browser, field))
@@ -154,16 +152,46 @@ class AtombergHandler(BaseBrandHandler):
             time.sleep(1)
 
             stage = "waiting for Atomberg dealer cards"
-            wait.until(
-                lambda browser: self._dismiss_modal_and_get_cards(
-                    browser, initial_signature
+            result_wait = WebDriverWait(driver, 20)
+            try:
+                result_state = result_wait.until(
+                    lambda browser: self._result_state(
+                        browser,
+                        initial_signature,
+                        pincode,
+                    )
                 )
-            )
+            except Exception:
+                # Some locator builds ignore the button click until the input
+                # itself emits an Enter/submit event.
+                field.send_keys(Keys.ENTER)
+                time.sleep(1)
+                try:
+                    result_state = result_wait.until(
+                        lambda browser: self._result_state(
+                            browser,
+                            initial_signature,
+                            pincode,
+                        )
+                    )
+                except Exception:
+                    # Nearby pincodes can legitimately produce the same first
+                    # cards and therefore the same signature.
+                    result_state = (
+                        "cards" if self._store_card_snapshots(driver) else False
+                    )
+                    if not result_state:
+                        raise
             time.sleep(2)
+            if result_state == "empty":
+                print(f"[Atomberg] No stores listed for pincode {pincode}")
+                return []
 
             records = self._parse_results(
                 driver.page_source, category, state, city, pincode
             )
+            if not records and self._store_card_snapshots(driver):
+                raise RuntimeError("dealer cards rendered but could not be parsed")
             print(f"[Atomberg] Parsed {len(records)} rendered cards")
             return records
         except Exception as exc:
@@ -391,6 +419,34 @@ class AtombergHandler(BaseBrandHandler):
                     return element
         return False
 
+    @staticmethod
+    def _select_pincode_suggestion(driver, pincode: str) -> bool:
+        """Select an autocomplete option when the locator requires one."""
+        try:
+            return bool(driver.execute_script(
+                """
+                const pin = arguments[0];
+                const visible = (el) => {
+                  const rect = el.getBoundingClientRect();
+                  const style = window.getComputedStyle(el);
+                  return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const choices = [...document.querySelectorAll(
+                  '[role="option"], [class*="suggest"], [class*="autocomplete"] li'
+                )].filter(visible);
+                const exact = choices.find((el) =>
+                  (el.innerText || el.textContent || '').includes(pin)
+                );
+                if (!exact) return false;
+                exact.click();
+                return true;
+                """,
+                pincode,
+            ))
+        except Exception:
+            return False
+
     @classmethod
     def _cards_updated_or_present(cls, driver, initial_signature):
         cards = cls._store_card_snapshots(driver)
@@ -405,6 +461,45 @@ class AtombergHandler(BaseBrandHandler):
     def _dismiss_modal_and_get_cards(cls, driver, initial_signature):
         cls._close_contact_modal_with_script(driver)
         return cls._cards_updated_or_present(driver, initial_signature)
+
+    @classmethod
+    def _result_state(cls, driver, initial_signature, pincode: str):
+        cls._close_contact_modal_with_script(driver)
+        if cls._no_results_visible(driver):
+            return "empty"
+        cards = cls._store_card_snapshots(driver)
+        if not cards:
+            return False
+        signature = cls._card_signature(driver)
+        if not initial_signature or signature != initial_signature:
+            return "cards"
+        if any(pincode in text for text in cards):
+            return "cards"
+        return False
+
+    @staticmethod
+    def _no_results_visible(driver) -> bool:
+        try:
+            return bool(driver.execute_script(
+                """
+                const visible = (el) => {
+                  const rect = el.getBoundingClientRect();
+                  const style = window.getComputedStyle(el);
+                  return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                return [...document.querySelectorAll(
+                  'main, section, div, p, span'
+                )].some((el) => {
+                  if (!visible(el) || el.children.length > 5) return false;
+                  const text = (el.innerText || el.textContent || '')
+                    .replace(/\\s+/g, ' ').trim().toLowerCase();
+                  return /no (stores?|dealers?|results?|locations?) (found|available)|we couldn't find|not available in this area/.test(text);
+                });
+                """
+            ))
+        except Exception:
+            return False
 
     @classmethod
     def _store_card_snapshots(cls, driver):
