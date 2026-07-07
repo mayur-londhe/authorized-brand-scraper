@@ -154,6 +154,29 @@ def parse_pincodes(value: str) -> list[str]:
     return list(dict.fromkeys(re.findall(r"(?<!\d)[1-9]\d{5}(?!\d)", value or "")))
 
 
+INDIAN_STATES = (
+    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh",
+    "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand",
+    "Karnataka", "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur",
+    "Meghalaya", "Mizoram", "Nagaland", "Odisha", "Punjab", "Rajasthan",
+    "Sikkim", "Tamil Nadu", "Telangana", "Tripura", "Uttar Pradesh",
+    "Uttarakhand", "West Bengal", "Andaman and Nicobar Islands",
+    "Chandigarh", "Dadra and Nagar Haveli and Daman and Diu", "Delhi",
+    "Jammu and Kashmir", "Ladakh", "Lakshadweep", "Puducherry",
+)
+
+
+def state_from_address(address: str) -> str:
+    return next(
+        (
+            state
+            for state in INDIAN_STATES
+            if re.search(rf"\b{re.escape(state)}\b", str(address or ""), re.IGNORECASE)
+        ),
+        "",
+    )
+
+
 def records_for_google_pincodes(records, pincodes, *, keep_other_pincodes: bool):
     """Filter verified rows by Google pincode while retaining rejected rows."""
     requested = list(dict.fromkeys(
@@ -1204,10 +1227,9 @@ def render_indiamart_dashboard() -> None:
     elif result.get("save_error"):
         st.warning(f"Local CSV created, but shared save failed: {result['save_error']}")
 
-    google_search_terms = st.text_input(
-        "Google Places search terms",
-        value="building materials",
-        key="indiamart-google-search-terms",
+    st.caption(
+        "Google verification uses the same anchored distance/address/name "
+        "algorithm as brand dealer verification."
     )
     if st.button(
         "Verify",
@@ -1221,8 +1243,19 @@ def render_indiamart_dashboard() -> None:
                 name=str(row.get("Company Name", "") or ""),
                 address=str(row.get("Address", "") or ""),
                 city=str(row.get("City", "") or ""),
+                state=state_from_address(str(row.get("Address", "") or "")),
+                state_name=state_from_address(str(row.get("Address", "") or "")),
+                pincode=(
+                    parse_pincodes(str(row.get("Pin Location", "") or ""))[:1]
+                    or parse_pincodes(str(row.get("Address", "") or ""))[:1]
+                    or [""]
+                )[0],
                 category=str(row.get("Subcategory", "") or ""),
-                phone=str(row.get("Phone", "") or ""),
+                phone=str(
+                    row.get("Contact Number", "")
+                    or row.get("Phone", "")
+                    or ""
+                ),
                 website=str(row.get("Company URL", "") or ""),
             )
             for row in source_rows
@@ -1239,10 +1272,9 @@ def render_indiamart_dashboard() -> None:
             )
 
         try:
-            verified_records = verify_records_with_google_current(
+            verified_records = verify_brand_records_with_google_v2_current(
                 dealer_records,
-                include_unverified=True,
-                search_terms=google_search_terms.strip() or "building materials",
+                city=city.strip(),
                 on_progress=update_google_progress,
             )
         except Exception as exc:
