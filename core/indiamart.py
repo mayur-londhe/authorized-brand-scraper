@@ -197,7 +197,7 @@ def _text_field(text: str, labels: str) -> str:
 def _address_from_text(text: str) -> str:
     lines = _text_lines(text)
     label = re.compile(
-        r"^(?:registered address|contact address|address|reach us)\s*:?\s*(.*)$",
+        r"^(?:registered address|contact address|address)\s*:?\s*(.*)$",
         re.IGNORECASE,
     )
     stop = re.compile(
@@ -438,17 +438,13 @@ async def extract_contact_details(context, company_url: str) -> dict:
             if url and url.rstrip("/") != initial_url.rstrip("/")
         ]
         contact_texts = []
-        if home_text:
+        if home_text and canonical_enquiry_url:
             contact_texts.append(home_text)
 
-        # The canonical IndiaMART enquiry page contains all structured company
-        # data. Only try alternate URLs when that primary page lacked details.
-        needs_fallback = not any((
-            details["Contact Person"],
-            details["Contact Number"],
-            details["Address"],
-            details["Trust Seal / GST Verified"] == "Yes",
-        ))
+        # Custom IndiaMART storefront domains often expose TrustSEAL/phone data
+        # on the homepage but keep the street address on /enquiry.html or a
+        # contact page. Do not treat those partial homepage details as enough.
+        needs_fallback = not details["Address"]
         for contact_url in candidate_urls if needs_fallback else []:
             try:
                 response = await navigate(contact_url)
@@ -459,6 +455,8 @@ async def extract_contact_details(context, company_url: str) -> dict:
                     contact_texts.append(body)
             except Exception:
                 continue
+        if home_text and not canonical_enquiry_url and home_text not in contact_texts:
+            contact_texts.append(home_text)
 
         # Contact fields come from /enquiry.html first, then text-link fallbacks.
         for text in contact_texts:
