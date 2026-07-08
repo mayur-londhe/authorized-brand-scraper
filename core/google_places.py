@@ -270,7 +270,7 @@ def fetch_places_by_product_locality(
     max_results: int = 20,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> list[dict]:
-    """Fetch operational Google Places for a free-text product/locality search."""
+    """Fetch Google Places for a product/locality search and return dealer rows."""
     product = str(product or "").strip()
     locality = str(locality or "").strip()
     if not product:
@@ -304,64 +304,90 @@ def fetch_places_by_product_locality(
     response.raise_for_status()
 
     rows = []
+    seen: set[tuple] = set()
+    closed_statuses = {"closed_permanently", "closed_temporarily"}
     for place in response.json().get("places") or []:
+        status = str(place.get("businessStatus") or "").strip()
+        if status.casefold() in closed_statuses:
+            continue
+
+        dealer_name = get_place_display_name(place)
+        formatted_address = str(place.get("formattedAddress") or "").strip()
         phone = str(
             place.get("nationalPhoneNumber")
             or place.get("internationalPhoneNumber")
             or ""
         ).strip()
-        if not phone:
+        place_id = str(place.get("id") or "").strip()
+        dedup_key = (
+            ("id", place_id)
+            if place_id
+            else (
+                "text",
+                _clean_text(dealer_name),
+                _clean_text(formatted_address),
+                re.sub(r"\D+", "", phone),
+            )
+        )
+        if dedup_key in seen:
             continue
-        status = str(place.get("businessStatus") or "").strip()
-        if status.casefold() != "operational":
-            continue
+        seen.add(dedup_key)
 
-        formatted_address = str(place.get("formattedAddress") or "").strip()
         coordinates = _place_coordinates(place)
         rating = place.get("rating")
         reviews = place.get("userRatingCount")
         rows.append({
-            "Product": product,
-            "Locality": locality,
-            "Place Name": get_place_display_name(place),
-            "Phone": phone,
+            "Dealer Name": dealer_name,
             "Address": formatted_address,
-            "Pincode": (
-                _address_component(place, "postal_code")
-                or _pincode(formatted_address)
-            ),
-            "City": (
-                _address_component(place, "locality")
-                or _address_component(place, "administrative_area_level_2")
-            ),
-            "State": _address_component(place, "administrative_area_level_1"),
-            "Rating": round(_safe_float(rating), 1) if rating is not None else None,
-            "Review Count": reviews,
-            "Business Status": status,
+            "Phone Number": phone,
             "Business Type": ", ".join(place.get("types", [])).replace("_", " "),
-            "Google Maps": (
+            "Geo Location": (
                 place.get("googleMapsUri")
                 or (
                     f"https://www.google.com/maps?q={coordinates[0]},{coordinates[1]}"
                     if coordinates else ""
                 )
             ),
-            "Website": place.get("websiteUri", ""),
-            "Place ID": place.get("id", ""),
-            "Latitude": coordinates[0] if coordinates else "",
-            "Longitude": coordinates[1] if coordinates else "",
-            "Google Score": google_sort_score(rating, reviews),
+            "City": (
+                _address_component(place, "locality")
+                or _address_component(place, "administrative_area_level_2")
+            ),
+            "State": _address_component(place, "administrative_area_level_1"),
+            "Pincode": (
+                _address_component(place, "postal_code")
+                or _pincode(formatted_address)
+            ),
+            "_rating": round(_safe_float(rating), 1) if rating is not None else 0,
+            "_reviews": _safe_int(reviews),
+            "_score": google_sort_score(rating, reviews),
         })
 
-    return sorted(
+    sorted_rows = sorted(
         rows,
         key=lambda row: (
-            -_safe_float(row.get("Google Score")),
-            -_safe_float(row.get("Rating")),
-            -_safe_int(row.get("Review Count")),
-            str(row.get("Place Name") or ""),
+            not (
+                _safe_int(row.get("_reviews")) > 5
+                and _safe_float(row.get("_rating")) >= 3.5
+            ),
+            -_safe_float(row.get("_rating")),
+            -_safe_int(row.get("_reviews")),
+            -_safe_float(row.get("_score")),
+            str(row.get("Dealer Name") or ""),
         ),
     )
+    return [
+        {
+            "Dealer Name": row.get("Dealer Name", ""),
+            "Address": row.get("Address", ""),
+            "Phone Number": row.get("Phone Number", ""),
+            "Business Type": row.get("Business Type", ""),
+            "Geo Location": row.get("Geo Location", ""),
+            "City": row.get("City", ""),
+            "State": row.get("State", ""),
+            "Pincode": row.get("Pincode", ""),
+        }
+        for row in sorted_rows
+    ]
 
 
 def _address_tokens(value: str) -> set[str]:

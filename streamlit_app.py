@@ -1337,21 +1337,22 @@ def render_indiamart_dashboard() -> None:
 
 
 def render_google_places_dashboard() -> None:
-    st.subheader("Google Places Search")
+    st.subheader("Google Places Extraction")
     st.caption(
-        "Search Google Places directly by product and locality. Results keep "
-        "only operational businesses that have a phone number."
+        "Search Google Places directly by product and locality. Results are "
+        "deduplicated, closed businesses are rejected, and stronger "
+        "rating/review matches are sorted first."
     )
 
     left, right = st.columns(2)
     product = left.text_input(
         "Product",
-        placeholder="concrete blocks",
+        placeholder="AAC block or FlyAsh brick",
         key="places-product",
     )
     locality = right.text_input(
         "Locality / City",
-        placeholder="Solapur or Indiranagar",
+        placeholder="Bidrahalli, Bengaluru or Hoskote, Bengaluru",
         key="places-locality",
     )
 
@@ -1415,7 +1416,7 @@ def render_google_places_dashboard() -> None:
         return
 
     dataframe = result["dataframe"]
-    st.success(f"Found {len(dataframe)} operational places with phone numbers.")
+    st.success(f"Found {len(dataframe)} Google Places dealer result(s).")
     if result.get("saved_key"):
         st.caption(f"Saved to shared files: {Path(result['saved_key']).name}")
     elif result.get("save_error"):
@@ -1429,7 +1430,7 @@ def render_google_places_dashboard() -> None:
         use_container_width=True,
     )
     if dataframe.empty:
-        st.info("No operational Google Places results with phone numbers were found.")
+        st.info("No Google Places results matched after dedup/closed-business filtering.")
         return
     st.dataframe(dataframe, use_container_width=True, hide_index=True)
 
