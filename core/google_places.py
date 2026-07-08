@@ -184,6 +184,21 @@ def google_sort_score(rating, reviews) -> float:
     return round(rating_value * math.log10(review_count + 1), 4)
 
 
+def _resolved_api_key(api_key: str | None = None) -> str:
+    resolved = (
+        api_key
+        or os.getenv("PLACES_API_KEY")
+        or os.getenv("GOOGLE_PLACES_API_KEY")
+        or os.getenv("GOOGLE_MAPS_API_KEY")
+        or ""
+    ).strip()
+    if not resolved:
+        raise RuntimeError(
+            "Google Places API key is missing. Set PLACES_API_KEY in .env."
+        )
+    return resolved
+
+
 def _coordinates(latitude, longitude) -> tuple[float, float] | None:
     try:
         lat, lng = float(latitude), float(longitude)
@@ -245,6 +260,108 @@ def _address_component(place: dict, component_type: str) -> str:
 def _pincode(value: str) -> str:
     match = re.search(r"(?<!\d)[1-9]\d{5}(?!\d)", str(value or ""))
     return match.group(0) if match else ""
+
+
+def fetch_places_by_product_locality(
+    product: str,
+    locality: str,
+    *,
+    api_key: str | None = None,
+    max_results: int = 20,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> list[dict]:
+    """Fetch operational Google Places for a free-text product/locality search."""
+    product = str(product or "").strip()
+    locality = str(locality or "").strip()
+    if not product:
+        raise ValueError("Enter a product.")
+    if not locality:
+        raise ValueError("Enter a locality or city.")
+
+    resolved_api_key = _resolved_api_key(api_key)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": resolved_api_key,
+        "X-Goog-FieldMask": (
+            "places.id,places.displayName,places.formattedAddress,"
+            "places.addressComponents,places.nationalPhoneNumber,"
+            "places.internationalPhoneNumber,places.rating,"
+            "places.userRatingCount,places.types,places.businessStatus,"
+            "places.location,places.websiteUri,places.googleMapsUri"
+        ),
+    }
+    body = {
+        "textQuery": f"{product} {locality} India",
+        "maxResultCount": max(1, min(int(max_results or 20), 20)),
+        "regionCode": "IN",
+    }
+    response = requests.post(
+        PLACES_SEARCH_URL,
+        json=body,
+        headers=headers,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+
+    rows = []
+    for place in response.json().get("places") or []:
+        phone = str(
+            place.get("nationalPhoneNumber")
+            or place.get("internationalPhoneNumber")
+            or ""
+        ).strip()
+        if not phone:
+            continue
+        status = str(place.get("businessStatus") or "").strip()
+        if status.casefold() != "operational":
+            continue
+
+        formatted_address = str(place.get("formattedAddress") or "").strip()
+        coordinates = _place_coordinates(place)
+        rating = place.get("rating")
+        reviews = place.get("userRatingCount")
+        rows.append({
+            "Product": product,
+            "Locality": locality,
+            "Place Name": get_place_display_name(place),
+            "Phone": phone,
+            "Address": formatted_address,
+            "Pincode": (
+                _address_component(place, "postal_code")
+                or _pincode(formatted_address)
+            ),
+            "City": (
+                _address_component(place, "locality")
+                or _address_component(place, "administrative_area_level_2")
+            ),
+            "State": _address_component(place, "administrative_area_level_1"),
+            "Rating": round(_safe_float(rating), 1) if rating is not None else None,
+            "Review Count": reviews,
+            "Business Status": status,
+            "Business Type": ", ".join(place.get("types", [])).replace("_", " "),
+            "Google Maps": (
+                place.get("googleMapsUri")
+                or (
+                    f"https://www.google.com/maps?q={coordinates[0]},{coordinates[1]}"
+                    if coordinates else ""
+                )
+            ),
+            "Website": place.get("websiteUri", ""),
+            "Place ID": place.get("id", ""),
+            "Latitude": coordinates[0] if coordinates else "",
+            "Longitude": coordinates[1] if coordinates else "",
+            "Google Score": google_sort_score(rating, reviews),
+        })
+
+    return sorted(
+        rows,
+        key=lambda row: (
+            -_safe_float(row.get("Google Score")),
+            -_safe_float(row.get("Rating")),
+            -_safe_int(row.get("Review Count")),
+            str(row.get("Place Name") or ""),
+        ),
+    )
 
 
 def _address_tokens(value: str) -> set[str]:

@@ -1336,6 +1336,104 @@ def render_indiamart_dashboard() -> None:
     st.dataframe(dataframe, use_container_width=True, hide_index=True)
 
 
+def render_google_places_dashboard() -> None:
+    st.subheader("Google Places Search")
+    st.caption(
+        "Search Google Places directly by product and locality. Results keep "
+        "only operational businesses that have a phone number."
+    )
+
+    left, right = st.columns(2)
+    product = left.text_input(
+        "Product",
+        placeholder="concrete blocks",
+        key="places-product",
+    )
+    locality = right.text_input(
+        "Locality / City",
+        placeholder="Solapur or Indiranagar",
+        key="places-locality",
+    )
+
+    if st.button(
+        "Fetch Google Places",
+        type="primary",
+        use_container_width=True,
+    ):
+        progress = st.progress(0, text="Searching Google Places...")
+        try:
+            current_google_places = importlib.reload(google_places_module)
+            rows = current_google_places.fetch_places_by_product_locality(
+                product,
+                locality,
+                max_results=20,
+            )
+        except Exception as exc:
+            progress.empty()
+            st.error(f"Google Places search failed: {exc}")
+        else:
+            progress.progress(1.0, text="Google Places search complete.")
+            progress.empty()
+            dataframe = pd.DataFrame(rows)
+            csv_data = dataframe.to_csv(index=False).encode("utf-8-sig")
+            filename = (
+                "google_places_"
+                + safe_filename_part(product)
+                + "_"
+                + safe_filename_part(locality)
+                + "_"
+                + datetime.now().strftime("%Y%m%d_%H%M%S")
+                + ".csv"
+            )
+            output_path = OUTPUT_DIR / filename
+            output_path.write_bytes(csv_data)
+
+            saved_key = None
+            save_error = None
+            if active_bucket_name():
+                try:
+                    storage = load_storage(active_bucket_name(), active_region())
+                    saved_key = storage.upload_path(
+                        output_path,
+                        key=f"exports/{filename}",
+                    )
+                except Exception as exc:
+                    save_error = str(exc)
+
+            st.session_state["google_places_result"] = {
+                "dataframe": dataframe,
+                "csv_data": csv_data,
+                "filename": filename,
+                "saved_key": saved_key,
+                "save_error": save_error,
+                "product": product,
+                "locality": locality,
+            }
+
+    result = st.session_state.get("google_places_result")
+    if not result:
+        return
+
+    dataframe = result["dataframe"]
+    st.success(f"Found {len(dataframe)} operational places with phone numbers.")
+    if result.get("saved_key"):
+        st.caption(f"Saved to shared files: {Path(result['saved_key']).name}")
+    elif result.get("save_error"):
+        st.warning(f"Local CSV created, but shared save failed: {result['save_error']}")
+
+    st.download_button(
+        "Download CSV",
+        data=result["csv_data"],
+        file_name=result["filename"],
+        mime="text/csv",
+        use_container_width=True,
+    )
+    if dataframe.empty:
+        st.info("No operational Google Places results with phone numbers were found.")
+        return
+    st.dataframe(dataframe, use_container_width=True, hide_index=True)
+
+
 def render_file_preview(key: str, data: bytes) -> None:
     suffix = Path(key).suffix.casefold()
     if suffix == ".xlsx":
@@ -1389,14 +1487,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.title("Dealer Finder")
-st.caption("Run dealer and IndiaMART scrapers and manage generated files.")
+st.caption("Run dealer, IndiaMART, and Google Places searches and manage generated files.")
 
-scraper_tab, indiamart_tab, files_tab = st.tabs(
-    ["Brand Authorized Directory", "B2B Directory", "Output"]
+scraper_tab, indiamart_tab, places_tab, files_tab = st.tabs(
+    ["Brand Authorized Directory", "B2B Directory", "Google Places", "Output"]
 )
 with scraper_tab:
     render_scraper_dashboard(load_registry())
 with indiamart_tab:
     render_indiamart_dashboard()
+with places_tab:
+    render_google_places_dashboard()
 with files_tab:
     render_s3_dashboard()
