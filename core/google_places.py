@@ -390,6 +390,152 @@ def fetch_places_by_product_locality(
     ]
 
 
+def fetch_places_by_product_pincode(
+    product: str,
+    pincode: str,
+    *,
+    api_key: str | None = None,
+    max_results: int = 20,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> list[dict]:
+    """Fetch Google Places for a product/pincode search and return dealer rows.
+    
+    Searches Google Places directly by product and pincode, returning all results
+    matching exactly the pincode. Results are deduplicated and sorted with stronger
+    rating/review matches first.
+    """
+    product = str(product or "").strip()
+    pincode = str(pincode or "").strip()
+    if not product:
+        raise ValueError("Enter a product.")
+    if not pincode:
+        raise ValueError("Enter a pincode.")
+    if len(pincode) != 6 or not pincode.isdigit():
+        raise ValueError("Enter a valid six-digit pincode.")
+
+    resolved_api_key = _resolved_api_key(api_key)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": resolved_api_key,
+        "X-Goog-FieldMask": (
+            "places.id,places.displayName,places.formattedAddress,"
+            "places.addressComponents,places.nationalPhoneNumber,"
+            "places.internationalPhoneNumber,places.rating,"
+            "places.userRatingCount,places.types,places.businessStatus,"
+            "places.location,places.websiteUri,places.googleMapsUri"
+        ),
+    }
+    body = {
+        "textQuery": f"{product} {pincode} India",
+        "maxResultCount": max(1, min(int(max_results or 20), 20)),
+        "regionCode": "IN",
+    }
+    response = requests.post(
+        PLACES_SEARCH_URL,
+        json=body,
+        headers=headers,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+
+    rows = []
+    seen: set[tuple] = set()
+    closed_statuses = {"closed_permanently", "closed_temporarily"}
+    for place in response.json().get("places") or []:
+        status = str(place.get("businessStatus") or "").strip()
+        if status.casefold() in closed_statuses:
+            continue
+
+        # Extract pincode from the place's address
+        place_pincode = (
+            _address_component(place, "postal_code")
+            or _pincode(str(place.get("formattedAddress") or ""))
+        )
+        
+        # Only include places that match the requested pincode exactly
+        if place_pincode != pincode:
+            continue
+
+        dealer_name = get_place_display_name(place)
+        formatted_address = str(place.get("formattedAddress") or "").strip()
+        phone = str(
+            place.get("nationalPhoneNumber")
+            or place.get("internationalPhoneNumber")
+            or ""
+        ).strip()
+        place_id = str(place.get("id") or "").strip()
+        dedup_key = (
+            ("id", place_id)
+            if place_id
+            else (
+                "text",
+                _clean_text(dealer_name),
+                _clean_text(formatted_address),
+                re.sub(r"\D+", "", phone),
+            )
+        )
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        coordinates = _place_coordinates(place)
+        rating = place.get("rating")
+        reviews = place.get("userRatingCount")
+        rows.append({
+            "Dealer Name": dealer_name,
+            "Address": formatted_address,
+            "Phone Number": phone,
+            "Business Type": ", ".join(place.get("types", [])).replace("_", " "),
+            "Geo Location": (
+                place.get("googleMapsUri")
+                or (
+                    f"https://www.google.com/maps?q={coordinates[0]},{coordinates[1]}"
+                    if coordinates else ""
+                )
+            ),
+            "City": (
+                _address_component(place, "locality")
+                or _address_component(place, "administrative_area_level_2")
+            ),
+            "State": _address_component(place, "administrative_area_level_1"),
+            "Pincode": place_pincode,
+            "Rating": round(_safe_float(rating), 1) if rating is not None else None,
+            "Review Count": _safe_int(reviews),
+            "_rating": round(_safe_float(rating), 1) if rating is not None else 0,
+            "_reviews": _safe_int(reviews),
+            "_score": google_sort_score(rating, reviews),
+        })
+
+    sorted_rows = sorted(
+        rows,
+        key=lambda row: (
+            not (
+                _safe_int(row.get("_reviews")) > 5
+                and _safe_float(row.get("_rating")) >= 3.5
+            ),
+            -_safe_float(row.get("_rating")),
+            -_safe_int(row.get("_reviews")),
+            -_safe_float(row.get("_score")),
+            str(row.get("Dealer Name") or ""),
+        ),
+    )
+    return [
+        {
+            "Dealer Name": row.get("Dealer Name", ""),
+            "Address": row.get("Address", ""),
+            "Phone Number": row.get("Phone Number", ""),
+            "Business Type": row.get("Business Type", ""),
+            "Geo Location": row.get("Geo Location", ""),
+            "City": row.get("City", ""),
+            "State": row.get("State", ""),
+            "Pincode": row.get("Pincode", ""),
+            "Rating": row.get("Rating"),
+            "Review Count": row.get("Review Count"),
+        }
+        for row in sorted_rows
+    ]
+
+
 def _address_tokens(value: str) -> set[str]:
     replacements = {
         "rd": "road",
