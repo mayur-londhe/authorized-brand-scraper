@@ -1339,7 +1339,7 @@ def render_indiamart_dashboard() -> None:
 def render_google_places_dashboard() -> None:
     st.subheader("Google Places Extraction")
     st.caption(
-        "Search Google Places directly by product and locality. Results are "
+        "Search Google Places directly by product and pincode. Results are "
         "deduplicated, closed businesses are rejected, and stronger "
         "rating/review matches are sorted first."
     )
@@ -1350,10 +1350,14 @@ def render_google_places_dashboard() -> None:
         placeholder="AAC block or FlyAsh brick",
         key="places-product",
     )
-    locality = right.text_input(
-        "Locality / City",
-        placeholder="Bidrahalli, Bengaluru or Hoskote, Bengaluru",
-        key="places-locality",
+    pincode = right.number_input(
+        "Pincode",
+        min_value=100000,
+        max_value=999999,
+        value=None,
+        step=1,
+        placeholder="560012 or 562123",
+        key="places-pincode",
     )
 
     if st.button(
@@ -1363,10 +1367,16 @@ def render_google_places_dashboard() -> None:
     ):
         progress = st.progress(0, text="Searching Google Places...")
         try:
+            if not product:
+                raise ValueError("Enter a product.")
+            if pincode is None:
+                raise ValueError("Enter a pincode.")
+            
+            pincode_str = str(int(pincode)).zfill(6)
             current_google_places = importlib.reload(google_places_module)
-            rows = current_google_places.fetch_places_by_product_locality(
+            rows = current_google_places.fetch_places_by_product_pincode(
                 product,
-                locality,
+                pincode_str,
                 max_results=20,
             )
         except Exception as exc:
@@ -1381,7 +1391,7 @@ def render_google_places_dashboard() -> None:
                 "google_places_"
                 + safe_filename_part(product)
                 + "_"
-                + safe_filename_part(locality)
+                + str(int(pincode)).zfill(6)
                 + "_"
                 + datetime.now().strftime("%Y%m%d_%H%M%S")
                 + ".csv"
@@ -1408,7 +1418,7 @@ def render_google_places_dashboard() -> None:
                 "saved_key": saved_key,
                 "save_error": save_error,
                 "product": product,
-                "locality": locality,
+                "pincode": pincode_str,
             }
 
     result = st.session_state.get("google_places_result")
