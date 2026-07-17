@@ -25,6 +25,7 @@ from core import (
 )
 from core.s3_storage import S3Storage
 from core.indiamart import run_indiamart_scrape
+from core.gst_extractor import extract_gstins_batch
 import core.google_places as google_places_module
 import core.schema as schema_module
 
@@ -787,6 +788,127 @@ def save_brand_v2_to_shared_files(
         return output_path, None, str(exc)
 
 
+def render_gst_extractor_dashboard() -> None:
+    """Render GST Extractor dashboard with bulk CSV upload."""
+    st.subheader("GST Number Extractor")
+    st.caption(
+        "Upload a CSV file with Shop Name and Shop Address columns. "
+        "Minimum 15 records required. Uses Gemini API to extract GSTIN numbers."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Upload CSV file",
+        type=["csv"],
+        help="CSV must contain 'Shop Name' and 'Shop Address' columns with minimum 15 rows"
+    )
+
+    if uploaded_file is not None:
+        try:
+            dataframe = pd.read_csv(uploaded_file)
+            
+            # Validate required columns
+            shop_name_col = find_column(dataframe, {"shop name", "name"})
+            shop_address_col = find_column(dataframe, {"shop address", "address"})
+            
+            if not shop_name_col or not shop_address_col:
+                st.error("CSV must contain 'Shop Name' and 'Shop Address' columns")
+                return
+            
+            # Check minimum record count
+            if len(dataframe) < 15:
+                st.error(f"Minimum 15 records required. Current: {len(dataframe)}")
+                return
+            
+            st.success(f"✓ Loaded {len(dataframe)} records from CSV")
+            
+            # Rename columns to standardized names
+            dataframe_normalized = dataframe.rename(columns={
+                shop_name_col: "Shop Name",
+                shop_address_col: "Shop Address"
+            })
+            
+            # Preview data
+            st.subheader("Data Preview")
+            st.dataframe(
+                dataframe_normalized[["Shop Name", "Shop Address"]].head(10),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            if st.button(
+                "Extract GSTIN Numbers",
+                type="primary",
+                use_container_width=True,
+            ):
+                progress_bar = st.progress(0, text="Starting GSTIN extraction...")
+                
+                try:
+                    # Convert dataframe to list of dicts
+                    records = dataframe_normalized.to_dict(orient="records")
+                    
+                    # Extract GSTIN for all records
+                    results = extract_gstins_batch(records)
+                    
+                    # Create results dataframe
+                    results_df = pd.DataFrame(results)
+                    
+                    progress_bar.empty()
+                    
+                    # Display results
+                    st.success(f"✓ GSTIN extraction completed for {len(results_df)} records")
+                    
+                    # Summary metrics
+                    found_count = sum(1 for gstin in results_df["GSTIN"] if gstin and gstin != "NOT_FOUND" and gstin != "INVALID_INPUT")
+                    not_found_count = sum(1 for gstin in results_df["GSTIN"] if gstin == "NOT_FOUND")
+                    invalid_count = sum(1 for gstin in results_df["GSTIN"] if gstin == "INVALID_INPUT")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("GSTIN Found", found_count)
+                    col2.metric("Not Found", not_found_count)
+                    col3.metric("Invalid Input", invalid_count)
+                    
+                    # Display results table
+                    st.subheader("Extraction Results")
+                    results_display = results_df[["Shop Name", "Shop Address", "GSTIN", "Status"]].copy()
+                    st.dataframe(
+                        results_display,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                    
+                    # Download results
+                    csv_data = results_df.to_csv(index=False).encode("utf-8-sig")
+                    filename = f"gst_extraction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    
+                    st.download_button(
+                        "Download Results CSV",
+                        data=csv_data,
+                        file_name=filename,
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                    
+                    # Save to S3 if configured
+                    bucket_name = active_bucket_name()
+                    if bucket_name:
+                        try:
+                            output_path = OUTPUT_DIR / filename
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+                            output_path.write_bytes(csv_data)
+                            storage = load_storage(bucket_name, active_region())
+                            key = storage.upload_path(output_path, key=f"exports/{filename}")
+                            st.caption(f"✓ Saved to shared files: {Path(key).name}")
+                        except Exception as exc:
+                            st.warning(f"Could not save to shared files: {exc}")
+                    
+                except Exception as exc:
+                    progress_bar.empty()
+                    st.error(f"GSTIN extraction failed: {exc}")
+
+        except Exception as exc:
+            st.error(f"Error reading CSV file: {exc}")
+
+
 def render_scraper_dashboard(registry: PluginRegistry) -> None:
     category = st.selectbox("Category", list(CATEGORY_BRANDS))
     scraper_category = canonical_category(category)
@@ -1500,8 +1622,8 @@ st.markdown(
 st.title("Dealer Finder")
 st.caption("Run dealer, IndiaMART, and Google Places searches and manage generated files.")
 
-scraper_tab, indiamart_tab, places_tab, files_tab = st.tabs(
-    ["Brand Authorized Directory", "B2B Directory", "Google Places", "Output"]
+scraper_tab, indiamart_tab, places_tab, gst_tab, files_tab = st.tabs(
+    ["Brand Authorized Directory", "B2B Directory", "Google Places", "GST Extractor", "Output"]
 )
 with scraper_tab:
     render_scraper_dashboard(load_registry())
@@ -1509,5 +1631,7 @@ with indiamart_tab:
     render_indiamart_dashboard()
 with places_tab:
     render_google_places_dashboard()
+with gst_tab:
+    render_gst_extractor_dashboard()
 with files_tab:
     render_s3_dashboard()
